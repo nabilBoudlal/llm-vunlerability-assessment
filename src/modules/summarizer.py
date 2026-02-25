@@ -8,57 +8,68 @@ from langchain_core.prompts import PromptTemplate
 
 class VulnerabilitySummarizer:
     def __init__(self, model_name="llama3:8b", vector_store=None):
+
         self.llm = OllamaLLM(model=model_name, temperature=0.0)
         self.vector_store = vector_store
 
     def analyze_single_service(self, finding, context):
+        
+        service_val = finding.get('service', 'Unknown')
+        version_val = finding.get('version', 'n/a')
+        port_val = finding.get('port', 'unk')
+
         template = """
-        [SYSTEM]: You are a Professional Security Auditor.
+        [SYSTEM]: You are a Cybersecurity Expert.
         [CONTEXT]: {context}
         [SERVICE]: {service} {version} on port {port}
 
-        [TASK]: Evaluate the security of the service using the provided context.
-        
-        [INSTRUCTIONS]:
-        1. If the context contains a 'POLICY_ALERT', you MUST report the protocol risk (e.g. cleartext, unauthenticated) even if no CVE is found.
-        2. If specific CVEs are found in the context, describe their impact and exploitation risk.
-        3. Prioritize findings: Critical (Backdoors/No Auth), High (Cleartext/RCE), Medium (Outdated), Low (Info).
-        4. Target OS is Linux. Discard any Windows-only context (e.g. MailEnable).
+        [TASK]: Analyze the service based ONLY on the provided context and your knowledge of security policies.
+        If a POLICY_ALERT is present in the context, prioritize it.
+        If the target is Linux, ignore Windows-specific vulnerabilities.
+
+        [STRICT RULE]: If the service is a diagnostic tool (e.g., Ping, Traceroute, SYN scanner) 
+        and the context contains CVEs for unrelated software (like Sendmail or BSD), 
+        ignore the CVEs and report 'Informational: No vulnerability found'.
 
         [OUTPUT FORMAT]:
-        - Risk Level: 
+        - Risk Level: (Critical/High/Medium/Low)
         - Vulnerability Type: (CVE or Protocol Risk)
-        - Technical Analysis: 
+        - Analysis: (Brief technical explanation)
         """
+        
         prompt = PromptTemplate(
             input_variables=["context", "service", "version", "port"], 
             template=template
         )
-        port_value = finding.get('portid') or finding.get('port') or "Unknown"
         
         chain = prompt | self.llm
         return chain.invoke({
-            "context": context if context else "No specific context found.",
-            "service": finding['service'],
-            "version": finding['version'],
-            "port": port_value
+            "context": context if context else "No context available.",
+            "service": service_val,
+            "version": version_val,
+            "port": port_val
         })
 
     def consolidate_report(self, target, detailed_findings):
+        """
+        Crea il report finale unificando le analisi singole.
+        """
         findings_text = "\n\n".join(detailed_findings)
+        
         template = """
-        [SYSTEM]: You are a Cybersecurity Consultant. 
-        [TARGET]: {target}
+        [SYSTEM]: Senior Security Consultant.
+        [TARGET IP]: {target}
         [ANALYSES]: {findings_text}
 
-        [TASK]: Consolidate the analyses into a formal Report.
-        [REQUIRED STRUCTURE]:
-        # Detailed Vulnerability Assessment: {target}
-        ## 1. Critical Exploits (RCE/Backdoors/Unauthenticated)
-        ## 2. Full Service Inventory & Analysis (Include a summary table)
-        ## 3. Configuration & Security Policy Issues (Cleartext protocols, etc.)
-        ## 4. Prioritized Remediation Plan
+        [TASK]: Professional Vulnerability Assessment Report.
+        [STRUCTURE]:
+        # Assessment Report: {target}
+        ## 1. Critical Exploits
+        ## 2. Service Inventory
+        ## 3. Policy & Configuration Issues
+        ## 4. Remediation Plan
         """
+        
         prompt = PromptTemplate(input_variables=["target", "findings_text"], template=template)
         chain = prompt | self.llm
         return chain.invoke({"target": target, "findings_text": findings_text})
