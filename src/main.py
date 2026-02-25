@@ -1,5 +1,6 @@
 import os
 import time
+import json
 from dotenv import load_dotenv
 
 from src.utils.parsers import ParserFactory
@@ -13,58 +14,77 @@ load_dotenv()
 def main():
     input_file = "data/network_scan.xml"
     api_key = os.getenv("NVD_API_KEY")
-    
-    # 1. Parsing: Estrarre dati dal report (Nmap o altri)
-    print(f"--- Standardizing Input from {input_file} ---")
-    hosts_data = ParserFactory.get_parser(input_file)
-    
-    # 2. Intelligence Gathering: Trovare servizi unici per il RAG
-    services_found = set()
-    for host in hosts_data:
-        for finding in host['findings']:
-            query = f"{finding['service']} {finding['version']}".strip()
-            if query and "unknown" not in query:
-                services_found.add(query)
-
-    # 3. Dynamic RAG: Scaricare solo ciò che serve
-    downloader = NVDDownloader(api_key=api_key)
     vsm = VectorStoreManager()
-    all_context = []
-    
-    for service in services_found:
-        print(f"[*] Live fetching CVEs for: {service}")
-        results = downloader.fetch_by_keyword(service) # Usa il metodo con keywordSearch
-        all_context.extend(results)
-        time.sleep(6 if api_key else 30) # Rispetta i limiti NIST
-
-    # 4. Inizializzazione Knowledge Base temporanea
-    if all_context:
-        vsm.initialize_db(all_context)
-    
-   # 5. Reporting with Host Aggregation
+    downloader = NVDDownloader(api_key=api_key)
     summarizer = VulnerabilitySummarizer(model_name="llama3:8b", vector_store=vsm)
     reporter = RiskReporter()
 
-    # Create a dictionary to merge findings by IP
-    aggregated_hosts = {}
-    for host in hosts_data:
-        ip = host['target']
-        if ip not in aggregated_hosts:
-            aggregated_hosts[ip] = {
-                "source": host['source'],
-                "target": ip,
-                "findings": []
-            }
-        aggregated_hosts[ip]["findings"].extend(host['findings'])
+    # 1. Caricamento Policy di Sicurezza
+    with open("data/security_policies.json", "r") as f:
+        policies = json.load(f)
 
-    # Process each unique host only once
-    for ip, data in aggregated_hosts.items():
-        print(f"[*] Analyzing target: {ip} with aggregated RAG enrichment...")
-        analysis = summarizer.generate_enhanced_report(data)
+    # 2. PARSING
+    print(f"[*] Reading scan results from: {input_file}")
+    hosts_data = ParserFactory.get_parser(input_file)
+
+    # 3. HYBRID RAG ENRICHMENT
+    all_context_data = []
+    unique_services = set()
+    noise = ["tcpwrapped", "unknown"]
+
+    for host in hosts_data:
+        for finding in host['findings']:
+            s_name = finding['service'].lower()
+            if any(n in s_name for n in noise): continue
+            
+            # Aggiunta Policy se il servizio è a rischio noto
+            for p in policies:
+                if s_name in p['services']:
+                    all_context_data.append(f"POLICY_ALERT: {p['category']} | Service: {s_name} | Risk: {p['risk']} | {p['description']}")
+
+            query = f"{finding['service']} {finding['version']}" if finding['version'] != 'n/a' else finding['service']
+            unique_services.add(query)
+
+    print(f"[*] Fetching NVD data for {len(unique_services)} services...")
+    for service in unique_services:
+        # Salta query NVD per servizi puramente logici (già coperti da policy)
+        if "bindshell" in service.lower(): continue 
         
-        report_name = f"{ip.replace('.', '_')}_final_assessment"
-        report_path = reporter.save_report(report_name, analysis)
-        print(f"[+] Final Consolidated Report generated: {report_path}")
+        print(f"    > Querying: {service}")
+        cves = downloader.fetch_by_keyword(service)
+        all_context_data.extend(cves)
+        time.sleep(6 if api_key else 30)
+
+    if all_context_data:
+        vsm.initialize_db(all_context_data)
+
+    # 4. ANALISI E REPORTING
+    for host in hosts_data:
+        target_ip = host['target']
+        print(f"[*] Analyzing host: {target_ip}")
+        detailed_findings = []
+        
+        # Uso un set per evitare di analizzare lo stesso servizio/porta più volte (evita duplicati nel report)
+        seen_findings = set()
+
+        for finding in host['findings']:
+            find_id = f"{finding['service']}-{finding.get('portid', 'unk')}"
+            if find_id in seen_findings or any(n in finding['service'].lower() for n in noise):
+                continue
+            
+            seen_findings.add(find_id)
+            service_query = f"{finding['service']} {finding['version']}"
+            print(f"    > Analyzing {service_query}...")
+            
+            context = vsm.search_context(service_query, k=5)
+            analysis = summarizer.analyze_single_service(finding, context)
+            detailed_findings.append(analysis)
+
+        if detailed_findings:
+            print(f"[*] Finalizing report for {target_ip}...")
+            report = summarizer.consolidate_report(target_ip, detailed_findings)
+            save_path = reporter.save_report(f"{target_ip.replace('.', '_')}_final", report)
+            print(f"[+] Success! Saved to: {save_path}")
 
 if __name__ == "__main__":
     main()

@@ -21,7 +21,7 @@ class VectorStoreManager:
         )
         print(f"--- Vector Database initialized with {len(documents)} entries ---")
 
-    def search_context(self, query, k=3):
+    def search_context(self, query, k=5):
         """Retrieves the most relevant security context from the local DB."""
         if not self.db:
             # Load existing database if not already in memory
