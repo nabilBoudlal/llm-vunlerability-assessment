@@ -12,20 +12,24 @@ class VectorStoreManager:
         self.db_path = db_path
         self.db = None
 
-    def initialize_db(self, documents):
-        """Creates a local vector database from CVE descriptions."""
+    def initialize_db(self, documents, metadatas):
+        """Crea il DB associando ogni documento al suo servizio specifico."""
         self.db = Chroma.from_texts(
-            texts=documents, 
-            embedding=self.embeddings, 
+            texts=documents,
+            metadatas=metadatas, # Aggiungiamo i metadati
+            embedding=self.embeddings,
             persist_directory=self.db_path
         )
-        print(f"--- Vector Database initialized with {len(documents)} entries ---")
 
-    def search_context(self, query, k=5):
-        """Retrieves the most relevant security context from the local DB."""
+    def search_context(self, query, service_name, k=5):
+        """Cerca solo i documenti che appartengono al servizio richiesto."""
         if not self.db:
-            # Load existing database if not already in memory
             self.db = Chroma(persist_directory=self.db_path, embedding_function=self.embeddings)
         
-        results = self.db.similarity_search(query, k=k)
+        # Applichiamo un filtro basato sul metadato 'service'
+        results = self.db.similarity_search(
+            query, 
+            k=k, 
+            filter={"service": service_name.lower()}
+        )
         return "\n".join([doc.page_content for doc in results])

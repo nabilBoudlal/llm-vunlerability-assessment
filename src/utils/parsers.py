@@ -27,11 +27,19 @@ class NmapXMLParser:
                 state = port.find('state')
                 if state is not None and state.get('state') == 'open':
                     srv = port.find('service')
+                    
+                    script_data = ""
+                    for script in port.findall('script'):
+                        script_id = script.get('id', '')
+                        script_output = script.get('output', '')
+                        script_data += f"[{script_id}]: {script_output}\n"
+
                     findings.append({
                         "service": srv.get('name', 'unknown') if srv is not None else "unknown",
                         "version": srv.get('version', 'n/a') if srv is not None else "n/a",
                         "port": port.get('portid', 'unk'),
-                        "cve": "N/A" # Nmap base non fornisce CVE
+                        "cve": "N/A",
+                        "description": script_data 
                     })
             if findings:
                 hosts.append({"source": "Nmap", "target": ip, "findings": findings})
