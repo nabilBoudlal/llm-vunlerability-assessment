@@ -122,7 +122,7 @@ def get_policy_context(finding: dict, policies: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 def main():
-    input_file = "data\\t1.xml"
+    input_file = "data/test_target.xml"
 
     # ------------------------------------------------------------------
     # 0. CLEAN ENVIRONMENT
