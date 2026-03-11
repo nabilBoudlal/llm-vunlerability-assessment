@@ -1,9 +1,23 @@
 """
 Hybrid CVE Downloader
 ---------------------
-  Tier 1 — CIRCL /api/cvefor/{cpe22}   version-pinned, no API key
-  Tier 2 — NVD   cpeName={cpe23}        version-pinned, uses CPE 2.3
-  Tier 3 — NVD   keywordSearch          fallback, uses human product name
+Two-tier lookup strategy:
+
+  Tier 1 — NVD cpeName={cpe23}
+            Version-pinned search using the exact CPE 2.3 string from Nmap.
+            Most accurate — returns only CVEs matching the specific version.
+
+  Tier 2 — NVD keywordSearch  (fallback)
+            Used when Tier 1 returns nothing (e.g. generic CPEs like linux_kernel
+            with no version, or services without a recognised NVD CPE entry).
+            Uses the human-readable product name from the Nmap service banner
+            (e.g. "Apache httpd 2.4.41") rather than the CPE internal field name
+            ("http_server") for better NVD index matching.
+
+Note: CIRCL CVE Search was evaluated as an additional source but removed due to
+unreliable availability (frequent 404s — the /cvefor endpoint does not accept
+wildcard characters in CPE 2.3 strings). NVD cpeName provides equivalent
+version-pinned accuracy with better reliability.
 """
 
 import requests
@@ -11,6 +25,7 @@ import time
 from typing import Optional
 
 NVD_DETAIL_URL = "https://nvd.nist.gov/vuln/detail/"
+NVD_CVE_URL    = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
 
 def _make_entry(cve_id, description, cvss_score, keyword):
@@ -24,7 +39,7 @@ def _make_entry(cve_id, description, cvss_score, keyword):
     }
 
 
-def _extract_cvss(metrics):
+def _extract_cvss(metrics: dict) -> str:
     for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
         if key in metrics:
             try:
@@ -34,83 +49,52 @@ def _extract_cvss(metrics):
     return "N/A"
 
 
-# ---------------------------------------------------------------------------
-# Tier 1 — CIRCL /api/cvefor/{cpe22}
-# ---------------------------------------------------------------------------
-
-def _fetch_circl(cpe22, label, max_results=20):
-    url = f"https://cve.circl.lu/api/cvefor/{cpe22}"
-    try:
-        resp = requests.get(url, timeout=15)
-        if resp.status_code != 200:
-            print(f"    [CIRCL]  HTTP {resp.status_code} — {url}")
-            return []
-        records = resp.json()
-        if not isinstance(records, list):
-            records = records.get("results", [])
-        results = []
-        for rec in records[:max_results]:
-            cve_id = rec.get("id", rec.get("CVE", ""))
-            if not cve_id:
-                continue
-            desc = rec.get("summary", rec.get("description", ""))
-            cvss = str(rec.get("cvss", "N/A"))
-            results.append(_make_entry(cve_id, desc, cvss, label))
-        return results
-    except Exception as e:
-        print(f"    [CIRCL]  Exception: {e}")
-        return []
+def _parse_nvd_response(resp, source_label: str) -> list:
+    results = []
+    for vuln in resp.json().get("vulnerabilities", []):
+        cve    = vuln["cve"]
+        cve_id = cve["id"]
+        desc   = next((d["value"] for d in cve["descriptions"] if d["lang"] == "en"), "")
+        cvss   = _extract_cvss(cve.get("metrics", {}))
+        results.append(_make_entry(cve_id, desc, cvss, source_label))
+    return results
 
 
 # ---------------------------------------------------------------------------
-# Tier 2 — NVD cpeName (requires CPE 2.3 format)
+# Tier 1 — NVD cpeName (version-pinned, requires CPE 2.3 format)
 # ---------------------------------------------------------------------------
 
-def _fetch_nvd_cpe(cpe23, headers, max_results=20):
+def _fetch_nvd_cpe(cpe23: str, headers: dict, max_results: int = 20) -> list:
     try:
         resp = requests.get(
-            "https://services.nvd.nist.gov/rest/json/cves/2.0",
+            NVD_CVE_URL,
             params={"cpeName": cpe23, "resultsPerPage": max_results},
             headers=headers, timeout=30,
         )
         if resp.status_code != 200:
             print(f"    [NVD-CPE] HTTP {resp.status_code} — cpeName={cpe23}")
             return []
-        results = []
-        for vuln in resp.json().get("vulnerabilities", []):
-            cve    = vuln["cve"]
-            cve_id = cve["id"]
-            desc   = next((d["value"] for d in cve["descriptions"] if d["lang"] == "en"), "")
-            cvss   = _extract_cvss(cve.get("metrics", {}))
-            results.append(_make_entry(cve_id, desc, cvss, cpe23))
-        return results
+        return _parse_nvd_response(resp, cpe23)
     except Exception as e:
         print(f"    [NVD-CPE] Exception: {e}")
         return []
 
 
 # ---------------------------------------------------------------------------
-# Tier 3 — NVD keyword (uses human-readable product name, not CPE field)
+# Tier 2 — NVD keyword search (fallback)
 # ---------------------------------------------------------------------------
 
-def _fetch_nvd_keyword(keyword, headers, max_results=20):
+def _fetch_nvd_keyword(keyword: str, headers: dict, max_results: int = 20) -> list:
     try:
         resp = requests.get(
-            "https://services.nvd.nist.gov/rest/json/cves/2.0",
+            NVD_CVE_URL,
             params={"keywordSearch": keyword, "resultsPerPage": max_results},
             headers=headers, timeout=30,
         )
         if resp.status_code != 200:
             print(f"    [NVD-KW]  HTTP {resp.status_code} — keyword={keyword}")
             return []
-        results = []
-        for vuln in resp.json().get("vulnerabilities", []):
-            cve    = vuln["cve"]
-            cve_id = cve["id"]
-            desc   = next((d["value"] for d in cve["descriptions"] if d["lang"] == "en"), "")
-            cvss   = _extract_cvss(cve.get("metrics", {}))
-            results.append(_make_entry(cve_id, desc, cvss, keyword))
-        return results
+        return _parse_nvd_response(resp, keyword)
     except Exception as e:
         print(f"    [NVD-KW]  Exception: {e}")
         return []
@@ -123,37 +107,34 @@ def _fetch_nvd_keyword(keyword, headers, max_results=20):
 class HybridCVEDownloader:
     """Drop-in replacement for NVDDownloader."""
 
-    def __init__(self, api_key=None):
+    def __init__(self, api_key: Optional[str] = None):
         self.headers = {"apiKey": api_key} if api_key else {}
         self._api_key_present = bool(api_key)
 
     # backward-compatible interface
-    def fetch_by_keyword(self, keyword, results_per_page=20):
+    def fetch_by_keyword(self, keyword: str, results_per_page: int = 20) -> list:
         return [e["text"] for e in self.fetch_structured(keyword, results_per_page)]
 
-    def fetch_structured(self, keyword, results_per_page=20):
-        """Keyword-only fetch — used by Stage 3 for LLM-generated queries."""
+    def fetch_structured(self, keyword: str, results_per_page: int = 20) -> list:
+        """Keyword-only structured fetch — used by Stage 3 for LLM-proposed queries."""
         return _fetch_nvd_keyword(keyword, self.headers, results_per_page)
 
-    def fetch_by_cpe(self, cpe_object, max_results=20):
+    def fetch_by_cpe(self, cpe_object: dict, max_results: int = 20) -> list:
         """
-        Three-tier lookup.
+        Two-tier CPE-driven lookup.
 
-        cpe_object keys (produced by NmapXMLParser):
-          raw     — CPE 2.2 string  → used for CIRCL
-          cpe23   — CPE 2.3 string  → used for NVD cpeName
-          vendor, product, version
-          product_name (optional)   → human name for keyword fallback
+        cpe_object keys (from NmapXMLParser + agent enrichment):
+          cpe23        — CPE 2.3 string  (e.g. cpe:2.3:a:apache:http_server:2.4.41:*...)
+          vendor       — CPE vendor token (e.g. "apache")
+          product      — CPE product token (e.g. "http_server")
+          version      — detected version  (e.g. "2.4.41")
+          product_name — human banner name (e.g. "Apache httpd") for Tier 2 fallback
         """
-        cpe22   = cpe_object.get("raw", "")
-        cpe23   = cpe_object.get("cpe23", "")
-        vendor  = cpe_object.get("vendor", "")
-        product = cpe_object.get("product", "")
-        version = cpe_object.get("version")
-        # Human-readable name (e.g. "Apache httpd") — better for keyword search
-        product_name = cpe_object.get("product_name", product)
-
-        label = f"{vendor}/{product}" + (f" {version}" if version else "")
+        cpe23        = cpe_object.get("cpe23", "")
+        vendor       = cpe_object.get("vendor", "")
+        product      = cpe_object.get("product", "")
+        version      = cpe_object.get("version")
+        product_name = cpe_object.get("product_name") or product
 
         seen_ids = set()
         results  = []
@@ -167,26 +148,18 @@ class HybridCVEDownloader:
                     added += 1
             print(f"              → {added} new CVEs from {src} ({len(seen_ids)} total unique)")
 
-        # ── Tier 1: CIRCL ──────────────────────────────────────────────────
-        if cpe22:
-            print(f"    [Tier-1 CIRCL]   {cpe22}")
-            _add(_fetch_circl(cpe22, label, max_results), "CIRCL")
-
-        # ── Tier 2: NVD CPE 2.3 ────────────────────────────────────────────
+        # ── Tier 1: NVD cpeName (version-pinned) ───────────────────────────
         if cpe23:
-            print(f"    [Tier-2 NVD-CPE] {cpe23}")
-            time.sleep(2 if self._api_key_present else 6)
+            print(f"    [Tier-1 NVD-CPE] {cpe23}")
             _add(_fetch_nvd_cpe(cpe23, self.headers, max_results), "NVD-CPE")
+            time.sleep(2 if self._api_key_present else 6)
 
-        # ── Tier 3: NVD keyword — only if tiers 1+2 returned nothing ───────
+        # ── Tier 2: NVD keyword fallback ───────────────────────────────────
         if len(results) == 0:
-            # Build keyword from human product name + version (not CPE field names)
             kw_parts = [p for p in [product_name, version] if p and p not in ("n/a", "*", "-")]
-            kw = " ".join(kw_parts).strip()
-            if not kw:
-                kw = f"{vendor} {product}".strip()
+            kw = " ".join(kw_parts).strip() or f"{vendor} {product}".strip()
             if kw:
-                print(f"    [Tier-3 NVD-KW]  '{kw}'  (tiers 1+2 empty)")
+                print(f"    [Tier-2 NVD-KW]  '{kw}'  (Tier 1 empty — fallback)")
                 time.sleep(6 if self._api_key_present else 30)
                 _add(_fetch_nvd_keyword(kw, self.headers, max_results), "NVD-KW fallback")
 

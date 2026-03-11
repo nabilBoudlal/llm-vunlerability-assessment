@@ -1,240 +1,234 @@
 """
-CVE Research Agent  (v3 — Grounded Autonomous Research)
----------------------------------------------------------
-Stage 1 — Deterministic CPE retrieval  (version-accurate candidates)
-Stage 2 — LLM autonomous evaluation    (filters candidates, proposes extra queries)
-Stage 3 — Deterministic execution      (runs LLM-proposed extra queries)
-"""
+CVE Research Agent — 3-Stage autonomous pipeline.
 
+Stage 1: Deterministic multi-source retrieval (NVD + OSV + Exploit-DB)
+Stage 2: LLM filters candidates and proposes additional queries
+Stage 3: Execute LLM-proposed extra queries across all sources
+"""
 import json
 import re
-import time
-
 from langchain_ollama import OllamaLLM
-from langchain_core.prompts import PromptTemplate
 
-
-_NOISE_SERVICES = {
-    "tcpwrapped", "unknown", "bindshell", "status",
-    "nlockmgr", "mountd", "rpcbind", "exec", "login",
-}
-
-# Prefixes the LLM sometimes adds to queries — strip them before querying NVD
-_QUERY_STRIP_PREFIXES = ("search ", "query ", "lookup ", "find ")
-
-
-def _clean_query(q):
-    """Remove any natural-language prefix the LLM added to a search query."""
-    q = q.strip()
-    lower = q.lower()
-    for prefix in _QUERY_STRIP_PREFIXES:
-        if lower.startswith(prefix):
-            q = q[len(prefix):]
-            break
-    return q.strip()
+from src.utils.multi_source_api import MultiSourceCVEDownloader, CVEEntry
 
 
 class CVEResearchAgent:
-    def __init__(self, nvd_downloader, model_name="llama3:8b"):
-        self.downloader = nvd_downloader
-        self.llm = OllamaLLM(model=model_name, temperature=0.0)
 
-    # ------------------------------------------------------------------
-    # Stage 1 — CPE-based candidate retrieval
-    # ------------------------------------------------------------------
+    def __init__(self, downloader: MultiSourceCVEDownloader,
+                 model_name: str = "llama3:8b"):
+        self.downloader = downloader
+        self.llm        = OllamaLLM(model=model_name, temperature=0.0)
 
-    def _fetch_cpe_candidates(self, hosts_data, api_key_present=False):
-        candidates     = []
-        seen_cpes      = set()
+    # ------------------------------------------------------------------ #
+
+    def research(self, hosts_data: list) -> tuple[list[str], dict]:
+        """
+        Returns:
+          rag_texts  : list of strings ready for ChromaDB
+          cve_sources: dict {CVE_ID -> source_name} for the reporter
+        """
+        # ── Stage 1 ────────────────────────────────────────────────────
+        print("[*] CVEResearchAgent — Stage 1: multi-source CPE retrieval")
+        stage1_entries: dict[str, CVEEntry] = {}
+
+        unique_cpes = {}    # cpe_raw → cpe_obj (includes human product name)
+        unique_kws  = set() # keyword fallbacks for findings with no CPE
 
         for host in hosts_data:
-            for finding in host.get("findings", []):
-                s_name = finding.get("service", "unknown").lower()
-                if any(n in s_name for n in _NOISE_SERVICES):
-                    continue
+            for finding in host["findings"]:
+                for cpe in finding.get("cpe_list", []):
+                    raw = cpe.get("raw", "")
+                    if raw and raw not in unique_cpes:
+                        # Attach the human product name from the finding
+                        # so the keyword fallback is "Linux telnetd" not "linux_kernel"
+                        cpe_enriched = dict(cpe)
+                        cpe_enriched.setdefault(
+                            "human_product",
+                            f"{finding.get('product', '')} {finding.get('version', '')}".strip()
+                        )
+                        unique_cpes[raw] = cpe_enriched
 
-                for cpe_obj in finding.get("cpe_list", []):
-                    raw = cpe_obj.get("raw", "")
-                    if not raw or raw in seen_cpes:
-                        continue
-                    seen_cpes.add(raw)
+                if not finding.get("cpe_list"):
+                    product = finding.get("product", finding.get("service", ""))
+                    version = finding.get("version", "")
+                    if product and product.lower() not in ("unknown", ""):
+                        unique_kws.add(f"{product} {version}".strip())
 
-                    # Inject the human-readable product name so Tier 3
-                    # keyword fallback uses "Apache httpd" not "http_server"
-                    enriched_cpe = dict(cpe_obj)
-                    enriched_cpe["product_name"] = finding.get("product", "")
+        for raw, cpe_obj in unique_cpes.items():
+            print(f"    > [Stage-1] CPE: {raw}")
+            entries = self.downloader.fetch_by_cpe(cpe_obj)
+            for e in entries:
+                if e.id not in stage1_entries:
+                    stage1_entries[e.id] = e
+                elif e.has_exploit:
+                    stage1_entries[e.id].has_exploit = True
+            print(f"              → {len(stage1_entries)} total unique CVEs so far")
 
-                    print(f"    > [Stage-1] CPE: {raw}")
-                    entries = self.downloader.fetch_by_cpe(enriched_cpe)
-                    candidates.extend(entries)
+        for kw in unique_kws:
+            print(f"    > [Stage-1] KW fallback: {kw}")
+            entries = self.downloader.fetch_structured(kw)
+            for e in entries:
+                if e.id not in stage1_entries:
+                    stage1_entries[e.id] = e
+            print(f"              → {len(stage1_entries)} total unique CVEs so far")
 
-                    time.sleep(2 if api_key_present else 8)
+        print(f"[*] Stage 1 complete: {len(stage1_entries)} CVE candidates.")
 
-        print(f"[*] Stage 1 complete: {len(candidates)} CVE candidates.")
-        return candidates
+        # ── Stage 2 ────────────────────────────────────────────────────
+        print("[*] CVEResearchAgent — Stage 2: LLM autonomous evaluation")
+        stage1_summary = self._build_summary(hosts_data, stage1_entries)
+        llm_result     = self._llm_evaluate(stage1_summary)
 
-    # ------------------------------------------------------------------
-    # Stage 2 — LLM autonomous evaluation
-    # ------------------------------------------------------------------
+        relevant_ids  = set(llm_result.get("relevant_cve_ids", []))
+        extra_queries = llm_result.get("additional_queries", [])
 
-    def _build_findings_summary(self, hosts_data):
-        lines = []
-        for host in hosts_data:
-            ip = host.get("target", "unknown")
-            for f in host.get("findings", []):
-                svc  = f.get("service", "unknown")
-                prod = f.get("product", "")
-                ver  = f.get("version", "n/a")
-                port = f.get("port", "unk")
-                cve  = f.get("cve", "N/A")
-                cpes = ", ".join(c["raw"] for c in f.get("cpe_list", []))
-
-                if any(n in svc.lower() for n in _NOISE_SERVICES):
-                    continue
-
-                line = f"[{ip}] Port {port}: {prod or svc} {ver}"
-                if cpes:
-                    line += f"  CPE: {cpes}"
-                if cve and cve != "N/A":
-                    line += f"  (scanner CVE: {cve})"
-                lines.append(line)
-        return "\n".join(lines)
-
-    def _build_candidates_summary(self, candidates):
-        lines = []
-        for c in candidates[:60]:
-            lines.append(
-                f"  {c['id']} | CVSS {c.get('cvss_score','N/A')} | "
-                f"{c['keyword']} | {c['description'][:120]}..."
-            )
-        return "\n".join(lines) if lines else "  (none retrieved)"
-
-    def _llm_evaluate_and_extend(self, hosts_data, candidates):
-        """
-        Ask the LLM to:
-          a) Filter candidates to only genuinely relevant CVEs.
-          b) Propose additional NVD keyword queries for any gaps.
-        """
-        findings_text   = self._build_findings_summary(hosts_data)
-        candidates_text = self._build_candidates_summary(candidates)
-
-        template = """\
-[SYSTEM]: You are a senior cybersecurity analyst performing an autonomous \
-Vulnerability Assessment following NIST SP 800-115.
-
-[SCAN FINDINGS]:
-{findings}
-
-[CVE CANDIDATES PRE-FETCHED FOR THESE SERVICES]:
-{candidates}
-
-[YOUR TASKS]:
-
-TASK A — Relevance Filtering
-Select only the CVE IDs that are genuinely relevant to the exact service \
-versions detected. Exclude CVEs targeting a different OS or a version range \
-that clearly does not include the detected version.
-
-TASK B — Gap Detection
-Identify services with no useful candidates or important vulnerability classes \
-you know are missing. For each gap, propose ONE precise NVD keyword search query.
-The query must be a plain search string (e.g. "Apache httpd 2.4.41 path traversal") \
-— do NOT add the word "search" or any other prefix.
-
-[OUTPUT — return ONLY valid JSON, no prose, no markdown fences]:
-{{
-  "relevant_cve_ids": ["CVE-XXXX-YYYY", ...],
-  "additional_queries": [
-    {{"service": "service name", "reason": "short reason", "query": "plain search string"}}
-  ]
-}}
-"""
-        prompt = PromptTemplate(
-            input_variables=["findings", "candidates"], template=template
-        )
-        raw = (prompt | self.llm).invoke({
-            "findings":   findings_text,
-            "candidates": candidates_text,
-        })
-
-        try:
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                return json.loads(match.group())
-        except Exception as e:
-            print(f"[!] LLM evaluation parse failed: {e}")
-            print(f"    Raw snippet: {raw[:300]}")
-
-        # Fallback: accept all candidates, no extra queries
-        return {
-            "relevant_cve_ids":   [c["id"] for c in candidates],
-            "additional_queries": [],
-        }
-
-    # ------------------------------------------------------------------
-    # Stage 3 — Execute LLM-requested extra queries
-    # ------------------------------------------------------------------
-
-    def _execute_additional_queries(self, queries, api_key_present=False):
-        texts      = []
-        references = {}
-        seen_q     = set()
-        sleep_time = 6 if api_key_present else 30
-
-        for item in queries:
-            q      = _clean_query(item.get("query", ""))
-            reason = item.get("reason", "")
-            if not q or q.lower() in seen_q:
-                continue
-            if any(n in q.lower() for n in _NOISE_SERVICES):
-                continue
-            seen_q.add(q.lower())
-
-            print(f"    > [Stage-3] '{q}'  — {reason}")
-            for e in self.downloader.fetch_structured(q):
-                texts.append(e["text"])
-                references[e["id"]] = e["url"]
-
-            time.sleep(sleep_time)
-
-        return texts, references
-
-    # ------------------------------------------------------------------
-    # Main entry-point
-    # ------------------------------------------------------------------
-
-    def research(self, hosts_data, api_key_present=False):
-        """
-        Returns
-        -------
-        all_cve_texts : list[str]   — for ChromaDB
-        cve_references : dict       — CVE_ID -> NVD URL for the report
-        """
-        print("\n[*] CVEResearchAgent — Stage 1: CPE candidate retrieval")
-        candidates = self._fetch_cpe_candidates(hosts_data, api_key_present)
-
-        print("\n[*] CVEResearchAgent — Stage 2: LLM autonomous evaluation")
-        evaluation         = self._llm_evaluate_and_extend(hosts_data, candidates)
-        relevant_ids       = set(evaluation.get("relevant_cve_ids", []))
-        additional_queries = evaluation.get("additional_queries", [])
+        # Safety net: if LLM filtered too aggressively (< 30% kept),
+        # fall back to keeping all stage1 entries. This prevents the LLM
+        # from accidentally discarding valid CVEs due to overly strict reasoning.
+        if stage1_entries and len(relevant_ids) < max(4, len(stage1_entries) * 0.3):
+            print(f"    [!] LLM kept only {len(relevant_ids)}/{len(stage1_entries)} CVEs "
+                  f"— safety net: keeping all Stage 1 entries.")
+            relevant_ids = set(stage1_entries.keys())
 
         print(f"    LLM: {len(relevant_ids)} relevant CVEs selected, "
-              f"{len(additional_queries)} extra queries proposed.")
+              f"{len(extra_queries)} extra queries proposed.")
 
-        selected = [c for c in candidates if c["id"] in relevant_ids] if relevant_ids else candidates
+        # ── Stage 3 ────────────────────────────────────────────────────
+        print("[*] CVEResearchAgent — Stage 3: executing LLM-proposed queries")
+        stage3_entries: dict[str, CVEEntry] = {}
+        for raw_q in extra_queries:
+            query = self._clean_query(raw_q)
+            if not query:
+                continue
+            print(f"    > [Stage-3] '{query}'")
+            entries = self.downloader.fetch_structured(query)
+            for e in entries:
+                if e.id not in stage1_entries and e.id not in stage3_entries:
+                    stage3_entries[e.id] = e
 
-        print("\n[*] CVEResearchAgent — Stage 3: executing LLM-proposed queries")
-        extra_texts, extra_refs = self._execute_additional_queries(
-            additional_queries, api_key_present
-        )
+        # ── Merge ──────────────────────────────────────────────────────
+        all_entries: dict[str, CVEEntry] = {**stage3_entries, **stage1_entries}
 
-        # Merge — CPE results overwrite keyword results on ID collision
-        all_texts  = [c["text"] for c in selected] + extra_texts
-        references = {**extra_refs, **{c["id"]: c["url"] for c in selected}}
+        final_entries: dict[str, CVEEntry] = {
+            cve_id: entry
+            for cve_id, entry in all_entries.items()
+            if cve_id in relevant_ids or cve_id in stage3_entries
+        }
 
+        exploit_count = sum(1 for e in final_entries.values() if e.has_exploit)
         print(
-            f"\n[+] Research complete: {len(all_texts)} entries, "
-            f"{len(references)} unique CVE IDs  "
-            f"[CPE-selected: {len(selected)} | LLM-extra: {len(extra_texts)}]"
+            f"[+] Research complete: {len(final_entries)} entries, "
+            f"{len(final_entries)} unique CVE IDs  "
+            f"[CPE-selected: {len(stage1_entries)} | "
+            f"LLM-extra: {len(stage3_entries)} | "
+            f"With public exploit: {exploit_count}]"
         )
-        return all_texts, references
+
+        rag_texts   = [e.to_rag_text() for e in final_entries.values()]
+        cve_sources = {e.id: e.source for e in final_entries.values()}
+        for e in final_entries.values():
+            if e.has_exploit:
+                cve_sources[e.id] = "exploitdb"
+
+        return rag_texts, cve_sources
+
+    # ------------------------------------------------------------------ #
+    # Helpers                                                              #
+    # ------------------------------------------------------------------ #
+
+    def _build_summary(self, hosts_data: list,
+                       candidates: dict[str, CVEEntry]) -> str:
+        findings_lines = []
+        for host in hosts_data:
+            for f in host["findings"]:
+                svc = f.get("service", "unknown")
+                ver = f.get("version", "n/a")
+                prt = f.get("port", "?")
+                prd = f.get("product", "")
+                findings_lines.append(
+                    f"  port {prt}: {prd or svc} {ver}".rstrip()
+                )
+
+        cve_lines = []
+        for e in list(candidates.values())[:60]:
+            exploit_tag = " [PUBLIC EXPLOIT]" if e.has_exploit else ""
+            cve_lines.append(
+                f"  [{e.source.upper()}{exploit_tag}] {e.id}: "
+                f"{e.description[:120]}"
+            )
+
+        return (
+            "SCAN FINDINGS:\n" + "\n".join(findings_lines) +
+            "\n\nCVE CANDIDATES:\n" + "\n".join(cve_lines)
+        )
+
+    def _llm_evaluate(self, summary: str) -> dict:
+        prompt = f"""
+        You are a cybersecurity expert evaluating CVE relevance for a Linux vulnerability assessment.
+
+        {summary}
+
+        TASK A — Filter CVEs:
+        Keep a CVE if ANY of these conditions are met:
+        1. The CVE description mentions the same product name as a scan finding.
+        2. The CVE describes a vulnerability type plausible for that service version.
+        3. The CVE is marked [PUBLIC EXPLOIT] — ALWAYS keep these.
+        Remove a CVE ONLY if it clearly targets a different OS (e.g. Windows-only)
+        or an entirely unrelated product.
+        When in doubt, KEEP the CVE.
+
+        TASK B — Gap queries:
+        Identify 1-3 vulnerability classes NOT covered by the candidates above.
+        Write SHORT, simple keyword queries (3-6 words max, NO boolean operators,
+        NO AND/OR/NOT, NO parentheses, NO CVE IDs in the query).
+        Example good queries: "OpenSSH 4.7 authentication bypass", "Samba remote code execution"
+
+        Respond ONLY with valid JSON, no explanation, no markdown fences:
+        {{
+        "relevant_cve_ids": ["CVE-XXXX-XXXXX", ...],
+        "additional_queries": ["short query 1", "short query 2"]
+        }}
+        """
+        raw = self.llm.invoke(prompt)
+        return self._parse_json(raw)
+
+    @staticmethod
+    def _parse_json(raw: str) -> dict:
+        try:
+            clean = re.sub(r"```(?:json)?|```", "", raw).strip()
+            start = clean.find("{")
+            end   = clean.rfind("}") + 1
+            if start != -1 and end > start:
+                return json.loads(clean[start:end])
+        except Exception:
+            pass
+        return {"relevant_cve_ids": [], "additional_queries": []}
+
+    @staticmethod
+    def _clean_query(raw: str) -> str:
+        """
+        Sanitize LLM-proposed queries for the NVD keyword API.
+        - Strip preamble phrases
+        - Remove boolean operators and special chars that cause HTTP 403
+        - Return empty string if query is just a CVE ID (not useful as keyword)
+        """
+        prefixes = [
+            "search for ", "search ", "query for ", "query: ",
+            "keyword: ", "look up ", "find ", "investigate ",
+        ]
+        q = raw.strip().strip('"').strip("'")
+
+        for p in prefixes:
+            if q.lower().startswith(p):
+                q = q[len(p):]
+
+        # Remove boolean operators and parentheses (cause NVD 403)
+        q = re.sub(r'\b(AND|OR|NOT)\b', '', q)
+        q = re.sub(r'[()"\']', '', q)
+        q = re.sub(r'\s+', ' ', q).strip()
+
+        # Skip if the query is just a CVE ID — not useful as keyword search
+        if re.match(r'^CVE-\d{4}-\d+$', q):
+            return ""
+
+        return q

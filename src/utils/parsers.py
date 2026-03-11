@@ -1,6 +1,7 @@
 import xml.etree.ElementTree as ET
 import os
 import csv
+import re
 
 
 class ParserFactory:
@@ -16,91 +17,47 @@ class ParserFactory:
 
 
 class NmapXMLParser:
-
-    @staticmethod
-    def _parse_cpe(cpe_string, service_version=None):
-        """
-        Parse a CPE string (2.2 or 2.3) into a structured dict AND
-        produce a CPE 2.3 string for NVD cpeName queries.
-
-        CPE 2.2: cpe:/a:vendor:product:version
-        CPE 2.3: cpe:2.3:a:vendor:product:version:*:*:*:*:*:*:*
-        """
-        if not cpe_string:
-            return None
-        try:
-            parts = cpe_string.split(":")
-
-            # ── CPE 2.3 ────────────────────────────────────────────────────
-            if len(parts) > 2 and parts[1] == "2.3":
-                vendor  = parts[3] if len(parts) > 3 else None
-                product = parts[4] if len(parts) > 4 else None
-                version = parts[5] if len(parts) > 5 and parts[5] not in ("*", "-", "") else None
-                cpe23   = cpe_string   # already 2.3
-                cpe22   = f"cpe:/{parts[2]}:{vendor}:{product}" + (f":{version}" if version else "")
-
-            # ── CPE 2.2 ────────────────────────────────────────────────────
-            else:
-                inner   = cpe_string.lstrip("cpe:/").split(":")
-                part    = inner[0] if inner else "a"   # a / o / h
-                vendor  = inner[1] if len(inner) > 1 else None
-                product = inner[2] if len(inner) > 2 else None
-                version = inner[3] if len(inner) > 3 and inner[3] not in ("*", "-", "") else None
-
-                # Use service banner version if CPE has none
-                if not version and service_version and service_version != "n/a":
-                    version = service_version
-
-                cpe22 = cpe_string
-                # Build CPE 2.3 for NVD
-                ver23 = version if version else "*"
-                cpe23 = f"cpe:2.3:{part}:{vendor}:{product}:{ver23}:*:*:*:*:*:*:*"
-
-            return {
-                "raw":    cpe22,    # used for CIRCL /cvefor
-                "cpe23":  cpe23,    # used for NVD cpeName
-                "vendor":  vendor,
-                "product": product,
-                "version": version,
-            }
-        except Exception:
-            return None
-
     @staticmethod
     def parse(file_path):
         tree = ET.parse(file_path)
         root = tree.getroot()
         hosts = []
 
-        for host in root.findall("host"):
-            addr = host.find("address")
-            ip   = addr.get("addr") if addr is not None else "unknown"
+        for host in root.findall('host'):
+            addr = host.find('address')
+            ip = addr.get('addr') if addr is not None else "unknown"
             findings = []
 
-            for port in host.findall(".//port"):
-                state = port.find("state")
-                if state is None or state.get("state") != "open":
+            for port in host.findall('.//port'):
+                state = port.find('state')
+                if state is None or state.get('state') != 'open':
                     continue
 
-                srv = port.find("service")
-                service_name    = srv.get("name",    "unknown") if srv is not None else "unknown"
-                service_version = srv.get("version", "n/a")     if srv is not None else "n/a"
-                # "product" is the human-readable product name (e.g. "Apache httpd")
-                service_product = srv.get("product", "")        if srv is not None else ""
+                srv     = port.find('service')
+                portid  = port.get('portid', 'unk')
+                sname   = srv.get('name', 'unknown')   if srv is not None else "unknown"
+                product = srv.get('product', '')        if srv is not None else ""
+                version = srv.get('version', 'n/a')    if srv is not None else "n/a"
 
-                cpe_objects = []
-                for cpe_el in port.findall(".//cpe"):
-                    parsed = NmapXMLParser._parse_cpe(cpe_el.text, service_version)
-                    if parsed:
-                        cpe_objects.append(parsed)
+                # Build CPE list from <cpe> child elements
+                cpe_list = []
+                if srv is not None:
+                    for cpe_el in srv.findall('cpe'):
+                        raw = cpe_el.text.strip() if cpe_el.text else ""
+                        if not raw:
+                            continue
+
+                        parsed_cpe = NmapXMLParser._parse_cpe(raw, product, version)
+                        if parsed_cpe:
+                            cpe_list.append(parsed_cpe)
 
                 findings.append({
-                    "service":  service_name,
-                    "product":  service_product,   # e.g. "Apache httpd", "Samba smbd"
-                    "version":  service_version,   # e.g. "2.4.41"
-                    "port":     port.get("portid", "unk"),
-                    "cve":      "N/A",
-                    "cpe_list": cpe_objects,
+                    "service":      sname,
+                    "product":      product,
+                    "version":      version,
+                    "port":         portid,
+                    "cve":          "N/A",
+                    "cpe_list":     cpe_list,
                 })
 
             if findings:
@@ -108,29 +65,86 @@ class NmapXMLParser:
 
         return hosts
 
+    @staticmethod
+    def _parse_cpe(raw: str, product: str, version: str) -> dict | None:
+        """
+        Convert CPE 2.2 string to CPE 2.3 format for NVD queries.
+
+        Rules:
+        - CPEs without a version (e.g. cpe:/o:linux:linux_kernel) get version '*'
+          in CPE 2.3 — NVD will 404 on these, so we rely on keyword fallback.
+        - The human_product field is set to the Nmap product banner (e.g.
+          "Linux telnetd") so the keyword fallback uses a meaningful string
+          instead of the CPE internal vendor/product name.
+        - Version is taken from the CPE string itself, NOT from the Nmap service
+          version field, to avoid cross-contamination between multiple CPEs on
+          the same port (e.g. openssh and linux_kernel sharing the SSH version).
+        """
+        # CPE 2.2 format: cpe:/part:vendor:product:version:...
+        parts = raw.split(':')
+        # parts[0] = "cpe"
+        # parts[1] = "/a", "/o", "/h"
+        # parts[2] = vendor
+        # parts[3] = product
+        # parts[4] = version (optional)
+
+        if len(parts) < 4:
+            return None
+
+        cpe_part    = parts[1].lstrip('/')          # a, o, h
+        cpe_vendor  = parts[2] if len(parts) > 2 else '*'
+        cpe_product = parts[3] if len(parts) > 3 else '*'
+        # Version from CPE string only — ignore Nmap service version
+        cpe_version = parts[4] if len(parts) > 4 and parts[4] else '*'
+
+        # Sanitize version: reject strings that are clearly not version numbers
+        # (e.g. "3.X - 4.X", "4.7p1 Debian 8ubuntu1") — use '*' instead
+        if cpe_version != '*':
+            if re.search(r'[A-Z].*\s', cpe_version) or ' - ' in cpe_version:
+                cpe_version = '*'
+
+        cpe23 = (
+            f"cpe:2.3:{cpe_part}:{cpe_vendor}:{cpe_product}:"
+            f"{cpe_version}:*:*:*:*:*:*:*"
+        )
+
+        return {
+            "raw":          raw,
+            "cpe23":        cpe23,
+            "vendor":       cpe_vendor,
+            "product":      cpe_product,
+            "version":      cpe_version,
+            "human_product": product,   # Nmap banner e.g. "Linux telnetd"
+        }
+
 
 class NessusCSVParser:
     @staticmethod
     def parse(file_path):
         hosts_dict = {}
-        with open(file_path, mode="r", encoding="utf-8") as f:
+        with open(file_path, mode='r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                ip = row.get("IP Address", row.get("Host", "unknown"))
+                ip = row.get('IP Address', row.get('Host', 'unknown'))
                 if ip not in hosts_dict:
                     hosts_dict[ip] = []
+
                 hosts_dict[ip].append({
-                    "service":  row.get("Plugin Name", row.get("Name", "Unknown")),
-                    "product":  "",
-                    "version":  "n/a",
-                    "port":     row.get("Port", "unk"),
-                    "cve":      row.get("CVE", "N/A"),
-                    "severity": row.get("Severity", "info"),
-                    "description": row.get("Description", ""),
-                    "cpe_list": [],
+                    "service":   row.get('Plugin Name', row.get('Name', 'Unknown')),
+                    "product":   row.get('Plugin Name', ''),
+                    "version":   "n/a",
+                    "port":      row.get('Port', 'unk'),
+                    "cve":       row.get('CVE', 'N/A'),
+                    "severity":  row.get('Severity', 'info'),
+                    "description": row.get('Description', ''),
+                    "cpe_list":  [],
                 })
 
-        return [
-            {"source": "Nessus", "target": ip, "findings": findings}
-            for ip, findings in hosts_dict.items()
-        ]
+        standardized_data = []
+        for ip, findings in hosts_dict.items():
+            standardized_data.append({
+                "source":   "Nessus",
+                "target":   ip,
+                "findings": findings,
+            })
+        return standardized_data
