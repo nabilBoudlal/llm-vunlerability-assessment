@@ -1,10 +1,9 @@
 """
 Multi-Source CVE Downloader
-Queries NVD, OSV (Google), and Exploit-DB in parallel and merges results.
-Each entry carries a 'source' field so the reporter can link to the right URL.
+Queries NVD, OSV (Google), and Exploit-DB and merges results.
+Each CVEEntry now carries cvss_score extracted from the NVD metrics block.
 """
 import requests
-import time
 from dataclasses import dataclass, field
 
 
@@ -12,7 +11,8 @@ from dataclasses import dataclass, field
 class CVEEntry:
     id:          str
     description: str
-    source:      str          # "nvd" | "osv" | "exploitdb"
+    source:      str           # "nvd" | "osv" | "exploitdb"
+    cvss_score:  str = "N/A"  # base score from NVD (e.g. "9.8")
     has_exploit: bool = False  # True if found in Exploit-DB
 
     def to_rag_text(self) -> str:
@@ -20,39 +20,49 @@ class CVEEntry:
         return (
             f"Source: {self.source}{exploit_flag} | "
             f"ID: {self.id} | "
+            f"CVSS: {self.cvss_score} | "
             f"Description: {self.description}"
         )
 
 
+def _extract_cvss(metrics: dict) -> str:
+    """Try CVSSv3.1, CVSSv3.0, CVSSv2 in order — return first valid base score."""
+    for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        if key in metrics:
+            try:
+                return str(metrics[key][0]["cvssData"]["baseScore"])
+            except (KeyError, IndexError):
+                pass
+    return "N/A"
+
+
 class MultiSourceCVEDownloader:
     """
-    Aggregates CVE data from multiple sources.
-    Results are deduplicated by CVE ID; Exploit-DB hits set has_exploit=True.
+    Aggregates CVE data from NVD, OSV, and Exploit-DB.
+    Deduplicated by CVE ID; Exploit-DB hits set has_exploit=True.
+    CVSS score is extracted from NVD metrics when available.
     """
 
     def __init__(self, nvd_api_key: str = None):
-        self.nvd_api_key  = nvd_api_key
-        self.nvd_base     = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-        self.nvd_headers  = {"apiKey": nvd_api_key} if nvd_api_key else {}
-        self.osv_base     = "https://api.osv.dev/v1/query"
-        self.edb_base     = "https://www.exploit-db.com/search"
+        self.nvd_api_key = nvd_api_key
+        self.nvd_base    = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+        self.nvd_headers = {"apiKey": nvd_api_key} if nvd_api_key else {}
+        self.osv_base    = "https://api.osv.dev/v1/query"
+        self.edb_base    = "https://www.exploit-db.com/search"
 
     # ------------------------------------------------------------------ #
     # Public interface                                                     #
     # ------------------------------------------------------------------ #
 
-    def fetch_by_cpe(self, cpe_obj: dict, results_per_page: int = 20) -> list[CVEEntry]:
-        """
-        Primary lookup: CPE-pinned NVD query (most version-accurate).
-        Falls back to keyword search if CPE returns 0 results.
-        """
-        cpe23   = cpe_obj.get("cpe23", "")
-        product = cpe_obj.get("product", "")
-        version = cpe_obj.get("version", "")
+    def fetch_by_cpe(self, cpe_obj: dict, results_per_page: int = 20) -> list:
+        cpe23         = cpe_obj.get("cpe23", "")
+        product       = cpe_obj.get("product", "")
+        version       = cpe_obj.get("version", "")
+        human_product = cpe_obj.get("human_product", "")
 
         entries: dict[str, CVEEntry] = {}
 
-        # Tier 1 — NVD CPE
+        # Tier 1 — NVD CPE (version-pinned)
         if cpe23:
             print(f"    [Tier-1 NVD-CPE] {cpe23}")
             nvd = self._nvd_cpe(cpe23, results_per_page)
@@ -61,13 +71,9 @@ class MultiSourceCVEDownloader:
             print(f"              → {len(nvd)} CVEs from NVD-CPE")
 
         # Tier 2 — NVD keyword fallback
-        # Prefer human_product (e.g. "Linux telnetd") over CPE internal name
-        # (e.g. "linux_kernel") which never matches keyword searches
-        human_product = cpe_obj.get("human_product", "")
-        kw_product    = human_product if human_product else product
+        kw_product = human_product if human_product else product
         if not entries and kw_product:
             kw = f"{kw_product} {version}".strip()
-            # Strip placeholder version strings that break keyword search
             for placeholder in (" None", " n/a", " N/A", " unknown"):
                 kw = kw.replace(placeholder, "")
             kw = kw.strip()
@@ -77,7 +83,7 @@ class MultiSourceCVEDownloader:
                 entries[e.id] = e
             print(f"              → {len(nvd_kw)} CVEs from NVD-KW fallback")
 
-        # Tier 3 — OSV (open source software, complements NVD)
+        # Tier 3 — OSV
         if product:
             osv = self._osv_keyword(product, version)
             new = 0
@@ -88,7 +94,7 @@ class MultiSourceCVEDownloader:
             if new:
                 print(f"    [OSV]  +{new} new CVEs from OSV")
 
-        # Tier 4 — Exploit-DB (marks has_exploit on existing entries)
+        # Tier 4 — Exploit-DB (marks has_exploit)
         if product:
             kw = f"{product} {version}".strip()
             exploit_ids = self._exploitdb_search(kw)
@@ -103,57 +109,32 @@ class MultiSourceCVEDownloader:
 
         return list(entries.values())
 
-    def fetch_by_keyword(self, keyword: str,
-                         results_per_page: int = 20) -> list[str]:
-        """
-        Backward-compatible method returning plain strings (for vector store).
-        """
-        entries: dict[str, CVEEntry] = {}
+    def fetch_by_keyword(self, keyword: str, results_per_page: int = 20) -> list:
+        """Backward-compatible — returns plain strings."""
+        return [e.to_rag_text() for e in self.fetch_structured(keyword, results_per_page)]
 
+    def fetch_structured(self, keyword: str, results_per_page: int = 20) -> list:
+        entries: dict[str, CVEEntry] = {}
         for e in self._nvd_keyword(keyword, results_per_page):
             entries[e.id] = e
-
         for e in self._osv_keyword(keyword):
             if e.id not in entries:
                 entries[e.id] = e
-
         for cve_id in self._exploitdb_search(keyword):
             if cve_id in entries:
                 entries[cve_id].has_exploit = True
-
-        return [e.to_rag_text() for e in entries.values()]
-
-    def fetch_structured(self, keyword: str,
-                         results_per_page: int = 20) -> list[CVEEntry]:
-        """
-        Keyword search across all sources, returning structured CVEEntry objects.
-        """
-        entries: dict[str, CVEEntry] = {}
-
-        for e in self._nvd_keyword(keyword, results_per_page):
-            entries[e.id] = e
-
-        for e in self._osv_keyword(keyword):
-            if e.id not in entries:
-                entries[e.id] = e
-
-        for cve_id in self._exploitdb_search(keyword):
-            if cve_id in entries:
-                entries[cve_id].has_exploit = True
-
         return list(entries.values())
 
     # ------------------------------------------------------------------ #
     # NVD                                                                  #
     # ------------------------------------------------------------------ #
 
-    def _nvd_cpe(self, cpe23: str, n: int) -> list[CVEEntry]:
+    def _nvd_cpe(self, cpe23: str, n: int) -> list:
         try:
             r = requests.get(
                 self.nvd_base,
                 params={"cpeName": cpe23, "resultsPerPage": n},
-                headers=self.nvd_headers,
-                timeout=30,
+                headers=self.nvd_headers, timeout=30,
             )
             if r.status_code == 404:
                 print(f"    [NVD-CPE] HTTP 404 — cpeName={cpe23}")
@@ -166,13 +147,12 @@ class MultiSourceCVEDownloader:
             print(f"    [NVD-CPE] error: {ex}")
             return []
 
-    def _nvd_keyword(self, keyword: str, n: int) -> list[CVEEntry]:
+    def _nvd_keyword(self, keyword: str, n: int) -> list:
         try:
             r = requests.get(
                 self.nvd_base,
                 params={"keywordSearch": keyword, "resultsPerPage": n},
-                headers=self.nvd_headers,
-                timeout=30,
+                headers=self.nvd_headers, timeout=30,
             )
             if r.status_code != 200:
                 print(f"    [NVD-KW] HTTP {r.status_code} for '{keyword}'")
@@ -183,49 +163,40 @@ class MultiSourceCVEDownloader:
             return []
 
     @staticmethod
-    def _parse_nvd(data: dict) -> list[CVEEntry]:
+    def _parse_nvd(data: dict) -> list:
         results = []
         for vuln in data.get("vulnerabilities", []):
-            cve  = vuln["cve"]
-            desc = next(
+            cve     = vuln["cve"]
+            desc    = next(
                 (d["value"] for d in cve["descriptions"] if d["lang"] == "en"), ""
             )
-            results.append(CVEEntry(id=cve["id"], description=desc, source="nvd"))
+            cvss    = _extract_cvss(cve.get("metrics", {}))
+            results.append(
+                CVEEntry(id=cve["id"], description=desc, source="nvd", cvss_score=cvss)
+            )
         return results
 
     # ------------------------------------------------------------------ #
-    # OSV  (https://osv.dev)                                              #
+    # OSV                                                                  #
     # ------------------------------------------------------------------ #
 
-    def _osv_keyword(self, product: str, version: str = "") -> list[CVEEntry]:
-        """
-        Query OSV by package name. OSV focuses on open source ecosystems
-        (PyPI, npm, Maven, Go, Linux, etc.) and often has entries NVD lacks.
-        We query without specifying ecosystem to get the broadest results.
-        """
+    def _osv_keyword(self, product: str, version: str = "") -> list:
         try:
             payload = {"query": product}
             if version:
                 payload["version"] = version
-            r = requests.post(
-                self.osv_base,
-                json=payload,
-                timeout=20,
-            )
+            r = requests.post(self.osv_base, json=payload, timeout=20)
             if r.status_code != 200:
                 return []
-            vulns = r.json().get("vulns", [])
             results = []
-            for v in vulns:
-                vuln_id = v.get("id", "")
-                # OSV uses its own IDs (GHSA-xxx, OSV-xxx) — extract CVE alias
-                cve_id  = None
+            for v in r.json().get("vulns", []):
+                cve_id = None
                 for alias in v.get("aliases", []):
                     if alias.startswith("CVE-"):
                         cve_id = alias
                         break
                 if not cve_id:
-                    continue   # skip non-CVE entries
+                    continue
                 summary = v.get("summary", v.get("details", ""))[:300]
                 results.append(CVEEntry(id=cve_id, description=summary, source="osv"))
             return results
@@ -237,12 +208,7 @@ class MultiSourceCVEDownloader:
     # Exploit-DB                                                           #
     # ------------------------------------------------------------------ #
 
-    def _exploitdb_search(self, keyword: str) -> list[str]:
-        """
-        Search Exploit-DB for public exploits matching the keyword.
-        Returns a list of CVE IDs found in exploit descriptions.
-        Exploit-DB does not require authentication for basic search.
-        """
+    def _exploitdb_search(self, keyword: str) -> list:
         try:
             r = requests.get(
                 self.edb_base,
@@ -256,13 +222,9 @@ class MultiSourceCVEDownloader:
             )
             if r.status_code != 200:
                 return []
-
-            data = r.json()
-            # Exploit-DB returns {"data": [...], "recordsTotal": N}
-            exploits = data.get("data", [])
+            exploits = r.json().get("data", [])
             cve_ids  = []
             for exp in exploits:
-                # Each exploit may reference CVE IDs in the "codes" field
                 for code in exp.get("codes", "").split(";"):
                     code = code.strip()
                     if code.startswith("CVE-"):

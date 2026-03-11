@@ -7,13 +7,25 @@ from langchain_ollama import OllamaLLM
 from langchain_core.prompts import PromptTemplate
 
 
+# Severity → emoji badge mapping (matches professional VA tool conventions)
+_SEVERITY_ICON = {
+    "Critical":      "🔴",
+    "High":          "🟠",
+    "Medium":        "🟡",
+    "Low":           "🟢",
+    "Informational": "ℹ️",
+}
+
+_SEVERITY_ORDER = ["Critical", "High", "Medium", "Low", "Informational"]
+
+
 class VulnerabilitySummarizer:
-    def __init__(self, model_name="llama3:8b", vector_store=None):
-        self.llm = OllamaLLM(model=model_name, temperature=0.0)
+    def __init__(self, model_name="qwen3:8b", vector_store=None):
+        self.llm          = OllamaLLM(model=model_name, temperature=0.0, verbose=False)
         self.vector_store = vector_store
 
     # ------------------------------------------------------------------
-    # Per-service analysis
+    # Per-service analysis  (called once per open port)
     # ------------------------------------------------------------------
 
     def analyze_single_service(self, finding, context):
@@ -77,64 +89,138 @@ REMEDIATION: <one concrete specific action — NOT just "update to latest versio
     # ------------------------------------------------------------------
     # Final report consolidation
     #
-    # KEY DESIGN: Sections 1-3 are built 100% in Python from parsed data.
+    # KEY DESIGN: Sections 0-3 are built 100% in Python from parsed data.
     # The LLM is called ONCE, only to write Section 4 bullet points.
-    # Python then concatenates everything — the LLM cannot overwrite or
-    # omit sections regardless of how it responds.
     # ------------------------------------------------------------------
 
-    def consolidate_report(self, target: str, detailed_findings: list) -> str:
+    def consolidate_report(self, target: str, detailed_findings: list,
+                           cve_sources: dict = None) -> str:
+        if cve_sources is None:
+            cve_sources = {}
 
-        # ── 1. Parse all per-service blocks ───────────────────────────
-        parsed = []
-        for block in detailed_findings:
-            entry = _parse_finding_block(block)
-            if entry:
-                parsed.append(entry)
+        # ── Parse all per-service LLM blocks ──────────────────────────
+        parsed = [_parse_finding_block(b) for b in detailed_findings]
+        parsed = [p for p in parsed if p]
 
-        # ── 2. Section 2 — complete service inventory ──────────────────
-        inventory_lines = []
+        # ── Helper functions ──────────────────────────────────────────
+
+        def _best_cvss(cve_ids_str: str) -> str:
+            """Return highest CVSS score from a comma-separated CVE list."""
+            if cve_ids_str.lower() == "none":
+                return "N/A"
+            best, best_f = "N/A", 0.0
+            for cve in cve_ids_str.split(","):
+                info = cve_sources.get(cve.strip(), {})
+                score = info.get("cvss", "N/A") if isinstance(info, dict) else "N/A"
+                try:
+                    f = float(score)
+                    if f > best_f:
+                        best_f, best = f, score
+                except (ValueError, TypeError):
+                    pass
+            return best
+
+        def _has_exploit(cve_ids_str: str) -> bool:
+            for cve in cve_ids_str.split(","):
+                info = cve_sources.get(cve.strip(), {})
+                if isinstance(info, dict) and info.get("exploit", False):
+                    return True
+            return False
+
+        def _icon(risk: str) -> str:
+            return _SEVERITY_ICON.get(risk, "•")
+
+        # ── Section 0 — Executive Summary ─────────────────────────────
+        counts = {s: 0 for s in _SEVERITY_ORDER}
         for e in parsed:
-            inventory_lines.append(
-                f"  - Port {e['port']:>5} | {e['service']:<35} | "
-                f"Risk: {e['risk_level']:<14} | CVEs: {e['cve_ids']}"
-            )
-        section2 = (
-            "\n".join(inventory_lines) if inventory_lines else "  None detected."
+            counts[e["risk_level"]] = counts.get(e["risk_level"], 0) + 1
+        policy_count  = sum(1 for e in parsed if e["has_policy_alert"])
+        exploit_count = sum(
+            1 for e in parsed
+            if e["cve_ids"].lower() != "none" and _has_exploit(e["cve_ids"])
         )
 
-        # ── 3. Section 1 — Critical/High services with CVEs ────────────
-        cve_findings = [
+        exec_summary = (
+            f"| Metric | Count |\n"
+            f"|--------|-------|\n"
+            f"| **Services Analysed** | {len(parsed)} |\n"
+            f"| 🔴 Critical | {counts['Critical']} |\n"
+            f"| 🟠 High | {counts['High']} |\n"
+            f"| 🟡 Medium | {counts['Medium']} |\n"
+            f"| 🟢 Low | {counts['Low']} |\n"
+            f"| ℹ️ Informational | {counts['Informational']} |\n"
+            f"| ⚠️ Policy Violations | {policy_count} |\n"
+            f"| 💥 Public Exploits Available | {exploit_count} |"
+        )
+
+        # ── Section 1 — Critical & High findings (card style) ─────────
+        critical_high = [
             e for e in parsed
             if e["risk_level"] in ("Critical", "High")
             and e["cve_ids"].lower() != "none"
         ]
-        sec1_blocks = []
-        for e in cve_findings:
-            sec1_blocks.append(
-                f"• **Port {e['port']} — {e['service']}**\n"
-                f"  CVEs: {e['cve_ids']}\n"
-                f"  {e['analysis']}"
-            )
-        section1 = "\n\n".join(sec1_blocks) if sec1_blocks else "None identified."
 
-        # ── 4. Section 3 — policy violations ───────────────────────────
+        sec1_blocks = []
+        for e in critical_high:
+            cvss    = _best_cvss(e["cve_ids"])
+            exploit = _has_exploit(e["cve_ids"])
+            icon    = _icon(e["risk_level"])
+
+            block = (
+                f"### {icon} Port {e['port']} — {e['service']}\n\n"
+                f"| Property | Value |\n"
+                f"|----------|-------|\n"
+                f"| **Severity** | **{e['risk_level']}** |\n"
+                f"| **CVE(s)** | {e['cve_ids']} |\n"
+                f"| **CVSS Base Score** | {cvss} |\n"
+                f"| **Public Exploit** | {'⚠️ Yes — exploit publicly available' if exploit else 'Not confirmed'} |\n"
+                f"| **Policy Violation** | {'Yes' if e['has_policy_alert'] else 'No'} |\n\n"
+                f"**Analysis:** {e['analysis']}\n"
+            )
+            sec1_blocks.append(block)
+
+        section1 = (
+            "\n---\n\n".join(sec1_blocks)
+            if sec1_blocks
+            else "_No Critical or High findings with associated CVEs._"
+        )
+
+        # ── Section 2 — Service Inventory (Markdown table) ────────────
+        table_header = (
+            "| Port | Service | Severity | CVSS | CVEs | Policy | Exploit |\n"
+            "|------|---------|----------|------|------|--------|---------|"
+        )
+        table_rows = []
+        for e in parsed:
+            cvss        = _best_cvss(e["cve_ids"])
+            policy_flag = "⚠️" if e["has_policy_alert"] else ""
+            exploit_flag= "💥" if e["cve_ids"].lower() != "none" and _has_exploit(e["cve_ids"]) else ""
+            icon        = _icon(e["risk_level"])
+            table_rows.append(
+                f"| {e['port']} | {e['service']} | {icon} {e['risk_level']} "
+                f"| {cvss} | {e['cve_ids']} | {policy_flag} | {exploit_flag} |"
+            )
+
+        section2 = table_header + "\n" + "\n".join(table_rows)
+
+        # ── Section 3 — Policy Violations ─────────────────────────────
         policy_findings = [e for e in parsed if e["has_policy_alert"]]
         sec3_blocks = []
         for e in policy_findings:
+            icon = _icon(e["risk_level"])
             sec3_blocks.append(
-                f"• **Port {e['port']} — {e['service']}**\n"
-                f"  {e['policy_description']}"
+                f"**{icon} Port {e['port']} — {e['service']}** &nbsp; "
+                f"`{e['risk_level']}`\n\n"
+                f"> {e['policy_description']}"
             )
         section3 = (
-            "\n\n".join(sec3_blocks) if sec3_blocks
-            else "No policy violations identified."
+            "\n\n".join(sec3_blocks)
+            if sec3_blocks
+            else "_No policy violations identified._"
         )
 
-        # ── 5. LLM generates ONLY Section 4 bullet text ────────────────
-        # Deduplicate by first 80 chars of remediation text
-        seen       = set()
-        unique_rem = []
+        # ── Section 4 — LLM Remediation Plan ──────────────────────────
+        seen, unique_rem = set(), []
         priority_order = (
             [e for e in parsed if e["risk_level"] == "Critical"] +
             [e for e in parsed if e["risk_level"] == "High"] +
@@ -148,54 +234,59 @@ REMEDIATION: <one concrete specific action — NOT just "update to latest versio
 
         rem_input_lines = []
         for e in unique_rem:
-            cve_part = f" ({e['cve_ids']})" if e["cve_ids"].lower() != "none" else ""
+            cve_part  = f" ({e['cve_ids']})" if e["cve_ids"].lower() != "none" else ""
+            cvss_part = f" [CVSS: {_best_cvss(e['cve_ids'])}]" if e["cve_ids"].lower() != "none" else ""
             rem_input_lines.append(
-                f"Port {e['port']} | {e['service']}{cve_part} | "
+                f"Port {e['port']} | {e['service']}{cve_part}{cvss_part} | "
                 f"Risk: {e['risk_level']} | Draft action: {e['remediation']}"
             )
-        rem_input = "\n".join(rem_input_lines)
+        rem_input  = "\n".join(rem_input_lines)
+        n_services = len(unique_rem)
 
         template = """\
 [SYSTEM]: You are a Senior Security Consultant writing a remediation plan.
 
-[TASK]: For each service below, write a short remediation block in Markdown.
+[TASK]: For each service below, write a concise remediation block in Markdown.
 Format EXACTLY like this example:
 
-**Port 21 | vsftpd 2.3.4**
-* Replace vsftpd with SFTP (OpenSSH subsystem) and disable anonymous login.
-* Apply CVE-2011-2523 patch or upgrade to vsftpd >= 3.0.5.
+**Port 21 | ProFTPD 1.3.1** `High` `CVSS: 7.5`
+* Replace ProFTPD with SFTP (OpenSSH subsystem) and disable anonymous login.
+* Apply patch for CVE-2010-3867 or upgrade to ProFTPD >= 1.3.3c.
 
 Rules:
-- Be specific. Name the exact protocol, version, config option, or patch.
+- Be specific: name exact protocol, version number, config option, or CVE patch.
 - Never write just "update to latest version" — always say what to update and why.
+- Include the severity badge and CVSS in the heading if available.
 - Maximum 2 bullet points per service.
 - CRITICAL: Output ONLY blocks for the {n_services} services listed below.
   Do NOT add, invent, or include any service not explicitly in the list.
-  Your output must have exactly {{n_services}} blocks — no more, no less.
+  Your output must have exactly {n_services} blocks — no more, no less.
 - No introduction, no summary, no conclusion.
 
 [SERVICES TO REMEDIATE]:
 {rem_input}
 """
-        n_services = len(unique_rem)
-        prompt  = PromptTemplate(
+        prompt   = PromptTemplate(
             input_variables=["rem_input", "n_services"],
             template=template,
         )
-        chain   = prompt | self.llm
+        chain    = prompt | self.llm
         section4 = chain.invoke({"rem_input": rem_input, "n_services": n_services})
 
-        # ── 6. Python assembles the complete report ─────────────────────
-        # The LLM output is placed ONLY in section 4.
-        # Sections 1-3 are written directly — never touched by the LLM.
+        # ── Assemble final report ──────────────────────────────────────
         report = (
-            f"# Assessment Report: {target}\n\n"
-            f"## 1. Critical Exploits\n\n"
+            f"## Executive Summary\n\n"
+            f"{exec_summary}\n\n"
+            f"---\n\n"
+            f"## 1. Critical & High Findings\n\n"
             f"{section1}\n\n"
+            f"---\n\n"
             f"## 2. Service Inventory\n\n"
             f"{section2}\n\n"
-            f"## 3. Policy & Configuration Issues\n\n"
+            f"---\n\n"
+            f"## 3. Policy & Configuration Violations\n\n"
             f"{section3}\n\n"
+            f"---\n\n"
             f"## 4. Remediation Plan\n\n"
             f"{section4.strip()}\n"
         )
@@ -248,7 +339,6 @@ def _parse_finding_block(block: str) -> dict | None:
     if current_key:
         fields[current_key] = " ".join(buffer).strip()
 
-    # Normalise has_policy_alert to bool
     raw_hpa = str(fields["has_policy_alert"]).strip().lower()
     fields["has_policy_alert"] = raw_hpa in ("yes", "true", "1")
 

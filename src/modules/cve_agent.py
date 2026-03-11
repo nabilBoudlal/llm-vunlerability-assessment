@@ -4,6 +4,8 @@ CVE Research Agent — 3-Stage autonomous pipeline.
 Stage 1: Deterministic multi-source retrieval (NVD + OSV + Exploit-DB)
 Stage 2: LLM filters candidates and proposes additional queries
 Stage 3: Execute LLM-proposed extra queries across all sources
+
+cve_sources return format: {CVE_ID: {"source": str, "cvss": str, "exploit": bool}}
 """
 import json
 import re
@@ -15,32 +17,28 @@ from src.utils.multi_source_api import MultiSourceCVEDownloader, CVEEntry
 class CVEResearchAgent:
 
     def __init__(self, downloader: MultiSourceCVEDownloader,
-                 model_name: str = "llama3:8b"):
+                 model_name: str = "qwen3:8b"):
         self.downloader = downloader
-        self.llm        = OllamaLLM(model=model_name, temperature=0.0)
-
-    # ------------------------------------------------------------------ #
+        self.llm        = OllamaLLM(model=model_name, temperature=0.0, verbose=False)
 
     def research(self, hosts_data: list) -> tuple[list[str], dict]:
         """
         Returns:
           rag_texts  : list of strings ready for ChromaDB
-          cve_sources: dict {CVE_ID -> source_name} for the reporter
+          cve_sources: dict {CVE_ID -> {"source": str, "cvss": str, "exploit": bool}}
         """
         # ── Stage 1 ────────────────────────────────────────────────────
         print("[*] CVEResearchAgent — Stage 1: multi-source CPE retrieval")
         stage1_entries: dict[str, CVEEntry] = {}
 
-        unique_cpes = {}    # cpe_raw → cpe_obj (includes human product name)
-        unique_kws  = set() # keyword fallbacks for findings with no CPE
+        unique_cpes = {}
+        unique_kws  = set()
 
         for host in hosts_data:
             for finding in host["findings"]:
                 for cpe in finding.get("cpe_list", []):
                     raw = cpe.get("raw", "")
                     if raw and raw not in unique_cpes:
-                        # Attach the human product name from the finding
-                        # so the keyword fallback is "Linux telnetd" not "linux_kernel"
                         cpe_enriched = dict(cpe)
                         cpe_enriched.setdefault(
                             "human_product",
@@ -82,9 +80,6 @@ class CVEResearchAgent:
         relevant_ids  = set(llm_result.get("relevant_cve_ids", []))
         extra_queries = llm_result.get("additional_queries", [])
 
-        # Safety net: if LLM filtered too aggressively (< 30% kept),
-        # fall back to keeping all stage1 entries. This prevents the LLM
-        # from accidentally discarding valid CVEs due to overly strict reasoning.
         if stage1_entries and len(relevant_ids) < max(4, len(stage1_entries) * 0.3):
             print(f"    [!] LLM kept only {len(relevant_ids)}/{len(stage1_entries)} CVEs "
                   f"— safety net: keeping all Stage 1 entries.")
@@ -108,7 +103,6 @@ class CVEResearchAgent:
 
         # ── Merge ──────────────────────────────────────────────────────
         all_entries: dict[str, CVEEntry] = {**stage3_entries, **stage1_entries}
-
         final_entries: dict[str, CVEEntry] = {
             cve_id: entry
             for cve_id, entry in all_entries.items()
@@ -117,18 +111,23 @@ class CVEResearchAgent:
 
         exploit_count = sum(1 for e in final_entries.values() if e.has_exploit)
         print(
-            f"[+] Research complete: {len(final_entries)} entries, "
-            f"{len(final_entries)} unique CVE IDs  "
+            f"[+] Research complete: {len(final_entries)} entries  "
             f"[CPE-selected: {len(stage1_entries)} | "
             f"LLM-extra: {len(stage3_entries)} | "
             f"With public exploit: {exploit_count}]"
         )
 
-        rag_texts   = [e.to_rag_text() for e in final_entries.values()]
-        cve_sources = {e.id: e.source for e in final_entries.values()}
-        for e in final_entries.values():
-            if e.has_exploit:
-                cve_sources[e.id] = "exploitdb"
+        rag_texts = [e.to_rag_text() for e in final_entries.values()]
+
+        # Enriched sources dict — includes CVSS and exploit flag for the reporter
+        cve_sources = {
+            e.id: {
+                "source":  "exploitdb" if e.has_exploit else e.source,
+                "cvss":    e.cvss_score,
+                "exploit": e.has_exploit,
+            }
+            for e in final_entries.values()
+        }
 
         return rag_texts, cve_sources
 
@@ -145,15 +144,14 @@ class CVEResearchAgent:
                 ver = f.get("version", "n/a")
                 prt = f.get("port", "?")
                 prd = f.get("product", "")
-                findings_lines.append(
-                    f"  port {prt}: {prd or svc} {ver}".rstrip()
-                )
+                findings_lines.append(f"  port {prt}: {prd or svc} {ver}".rstrip())
 
         cve_lines = []
         for e in list(candidates.values())[:60]:
             exploit_tag = " [PUBLIC EXPLOIT]" if e.has_exploit else ""
+            cvss_tag    = f" CVSS:{e.cvss_score}" if e.cvss_score != "N/A" else ""
             cve_lines.append(
-                f"  [{e.source.upper()}{exploit_tag}] {e.id}: "
+                f"  [{e.source.upper()}{exploit_tag}{cvss_tag}] {e.id}: "
                 f"{e.description[:120]}"
             )
 
@@ -164,31 +162,30 @@ class CVEResearchAgent:
 
     def _llm_evaluate(self, summary: str) -> dict:
         prompt = f"""
-        You are a cybersecurity expert evaluating CVE relevance for a Linux vulnerability assessment.
+You are a cybersecurity expert evaluating CVE relevance for a Linux vulnerability assessment.
 
-        {summary}
+{summary}
 
-        TASK A — Filter CVEs:
-        Keep a CVE if ANY of these conditions are met:
-        1. The CVE description mentions the same product name as a scan finding.
-        2. The CVE describes a vulnerability type plausible for that service version.
-        3. The CVE is marked [PUBLIC EXPLOIT] — ALWAYS keep these.
-        Remove a CVE ONLY if it clearly targets a different OS (e.g. Windows-only)
-        or an entirely unrelated product.
-        When in doubt, KEEP the CVE.
+TASK A — Filter CVEs:
+Keep a CVE if ANY of these conditions are met:
+  1. The CVE description mentions the same product name as a scan finding.
+  2. The CVE describes a vulnerability type plausible for that service version.
+  3. The CVE is marked [PUBLIC EXPLOIT] — ALWAYS keep these.
+Remove a CVE ONLY if it clearly targets a different OS (e.g. Windows-only)
+or an entirely unrelated product. When in doubt, KEEP the CVE.
 
-        TASK B — Gap queries:
-        Identify 1-3 vulnerability classes NOT covered by the candidates above.
-        Write SHORT, simple keyword queries (3-6 words max, NO boolean operators,
-        NO AND/OR/NOT, NO parentheses, NO CVE IDs in the query).
-        Example good queries: "OpenSSH 4.7 authentication bypass", "Samba remote code execution"
+TASK B — Gap queries:
+Identify 1-3 vulnerability classes NOT covered by the candidates above.
+Write SHORT, simple keyword queries (3-6 words max, NO boolean operators,
+NO AND/OR/NOT, NO parentheses, NO CVE IDs in the query).
+Example good queries: "OpenSSH 8.2 authentication bypass", "Samba remote code execution"
 
-        Respond ONLY with valid JSON, no explanation, no markdown fences:
-        {{
-        "relevant_cve_ids": ["CVE-XXXX-XXXXX", ...],
-        "additional_queries": ["short query 1", "short query 2"]
-        }}
-        """
+Respond ONLY with valid JSON, no explanation, no markdown fences:
+{{
+  "relevant_cve_ids": ["CVE-XXXX-XXXXX", ...],
+  "additional_queries": ["short query 1", "short query 2"]
+}}
+"""
         raw = self.llm.invoke(prompt)
         return self._parse_json(raw)
 
@@ -206,29 +203,17 @@ class CVEResearchAgent:
 
     @staticmethod
     def _clean_query(raw: str) -> str:
-        """
-        Sanitize LLM-proposed queries for the NVD keyword API.
-        - Strip preamble phrases
-        - Remove boolean operators and special chars that cause HTTP 403
-        - Return empty string if query is just a CVE ID (not useful as keyword)
-        """
         prefixes = [
             "search for ", "search ", "query for ", "query: ",
             "keyword: ", "look up ", "find ", "investigate ",
         ]
         q = raw.strip().strip('"').strip("'")
-
         for p in prefixes:
             if q.lower().startswith(p):
                 q = q[len(p):]
-
-        # Remove boolean operators and parentheses (cause NVD 403)
         q = re.sub(r'\b(AND|OR|NOT)\b', '', q)
         q = re.sub(r'[()"\']', '', q)
         q = re.sub(r'\s+', ' ', q).strip()
-
-        # Skip if the query is just a CVE ID — not useful as keyword search
         if re.match(r'^CVE-\d{4}-\d+$', q):
             return ""
-
         return q
