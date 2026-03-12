@@ -9,7 +9,7 @@ from src.modules.reporter import RiskReporter
 load_dotenv()
 
 INPUT_FILE = "data/network_scan.xml"
-MODEL      = os.getenv("VA_MODEL", "qwen3:8b")
+MODEL      = os.getenv("VA_MODEL", "llama3:8b")
 
 def main():
     agent    = VAAgent(model_name=MODEL, verbose=True)

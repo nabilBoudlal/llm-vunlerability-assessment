@@ -21,15 +21,52 @@ You have been given a list of services discovered on a target machine.
 DISCOVERED SERVICES:
 {services_json}
 
-Your task is to produce a research plan: for each service that may have security \
-vulnerabilities, define the NVD search queries needed to find relevant CVEs.
+Your task is to produce a research plan: for each service, define the NVD keyword \
+search queries needed to find relevant CVEs.
 
-Rules:
-- Focus on services with specific product names and versions
-- Generic services with no version (e.g. tcpwrapped, status, nlockmgr) need only 1 generic query
-- For well-known vulnerable services (vsftpd, telnet, ftp, smb) add extra targeted queries
-- You may add cross-service queries if you suspect shared libraries or components
-- Keep queries short and specific (2-5 words max)
+=== NVD KEYWORD SEARCH CONVENTIONS ===
+NVD indexes CVEs by the PRODUCT NAME as it appears in CPE strings, not by service names.
+Use the canonical product name, not the Nmap service label.
+
+CRITICAL naming rules (Nmap label → correct NVD keyword):
+  apache httpd      → "apache http server"   (NOT "apache httpd")
+  distccd / distcc  → "distcc"               (NOT "distccd")
+  apache jserv ajp  → "apache tomcat"        (NOT "apache jserv" or "ajp13")
+  unrealircd        → "unrealircd"           ✓ correct as-is
+  vsftpd            → "vsftpd"               ✓ correct as-is
+  proftpd           → "proftpd"             ✓ correct as-is
+  openssh           → "openssh"             ✓ correct as-is
+  postfix           → "postfix"             ✓ correct as-is
+  isc bind          → "bind"                (NOT "isc bind")
+  mysql             → "mysql"               ✓ correct as-is
+  postgresql        → "postgresql"          ✓ correct as-is
+  samba smbd        → "samba"               (NOT "samba smbd")
+  vnc               → "vnc"                 ✓ correct as-is
+  ruby drb          → "ruby"                (use "drb" as second query)
+  java rmi          → "java rmi"            ✓ correct as-is
+  rpcbind           → "rpcbind"             ✓ correct as-is
+
+Query construction rules:
+1. Always use the CANONICAL NVD product name (see table above)
+2. If version is known, add it as a second query: ["samba", "samba 3.0"]
+3. For well-known backdoored versions, add a "backdoor" query: ["vsftpd 2.3.4", "vsftpd backdoor"]
+4. For generic/wrapper services (tcpwrapped, nlockmgr, mountd, status, rpcbind aux):
+   use 1 short query only
+5. Maximum 3 queries per service
+6. Keep each query 2-4 words
+
+=== EXAMPLES ===
+Apache httpd 2.2.8 on port 80:
+  queries: ["apache http server 2.2", "apache http server"]
+
+distccd v1 on port 3632:
+  queries: ["distcc"]
+
+Apache Jserv (ajp13) on port 8009:
+  queries: ["apache tomcat", "ghostcat ajp"]
+
+ISC BIND 9.4.2 on port 53:
+  queries: ["bind 9.4.2", "bind dns"]
 
 Output ONLY a valid JSON array, no other text:
 [
@@ -69,11 +106,14 @@ Output ONLY a valid JSON object, no other text:
 }}
 
 Severity rules:
-- Critical: CVSS >= 9.0 OR known RCE/backdoor
+- Critical: CVSS >= 9.0 OR known RCE/backdoor OR bindshell/root shell exposure
 - High: CVSS 7.0-8.9 OR cleartext protocol with sensitive data OR deprecated protocol
 - Medium: CVSS 4.0-6.9 OR unnecessary service exposure
 - Low: CVSS < 4.0 OR minor configuration issue
 - Informational: no CVEs, no protocol risk, no exposure concern
+
+IMPORTANT: if the service is a bindshell, root shell, or any form of backdoor, \
+severity MUST be Critical.
 """
 
 # ── Phase 1: LLM Planning ─────────────────────────────────────────────────────
@@ -107,39 +147,69 @@ class VAAgent:
         return target, services
 
     def _phase1_plan(self, services: list) -> list:
-        """LLM reads service list and produces research plan."""
+        """LLM reads service list and produces research plan.
+        
+        Sends services in chunks of CHUNK_SIZE to avoid LLM truncation,
+        then applies a safety-net that ensures every service has at least
+        one query regardless of LLM output quality.
+        """
+        CHUNK_SIZE = 10
         print("\n[Phase 1] LLM planning research queries...")
-        prompt = PLANNING_PROMPT.format(
-            services_json=json.dumps(services, indent=2)
-        )
-        response = self.llm.invoke(prompt).strip()
 
-        if self.verbose:
-            print(f"  [llm raw] {response[:300]}...")
+        full_plan = []
+        chunks = [services[i:i+CHUNK_SIZE] for i in range(0, len(services), CHUNK_SIZE)]
 
-        # Extract JSON array
-        try:
-            m = re.search(r'\[[\s\S]+\]', response)
-            if m:
-                plan = json.loads(m.group(0))
-                print(f"  [plan] {len(plan)} services planned, "
-                      f"{sum(len(p.get('queries',[])) for p in plan)} total queries")
-                return plan
-        except Exception as e:
-            print(f"  [!] Failed to parse plan: {e}")
+        for chunk_idx, chunk in enumerate(chunks, 1):
+            print(f"  [chunk {chunk_idx}/{len(chunks)}] planning {len(chunk)} services...")
+            prompt = PLANNING_PROMPT.format(
+                services_json=json.dumps(chunk, indent=2)
+            )
+            response = self.llm.invoke(prompt).strip()
 
-        # Fallback: build basic plan from services
-        print("  [!] Using fallback plan (product+version per service)")
-        return [
-            {
-                "port":    s["port"],
-                "service": s["service"],
-                "product": s["product"],
-                "version": s["version"],
-                "queries": [f"{s['product']} {s['version']}".strip()]
-            }
-            for s in services
-        ]
+            if self.verbose and chunk_idx == 1:
+                print(f"  [llm raw] {response[:300]}...")
+
+            try:
+                m = re.search(r'\[[\s\S]+\]', response)
+                if m:
+                    chunk_plan = json.loads(m.group(0))
+                    full_plan.extend(chunk_plan)
+                    print(f"  [chunk {chunk_idx}] → {len(chunk_plan)} entries parsed")
+                else:
+                    raise ValueError("No JSON array found")
+            except Exception as e:
+                print(f"  [!] Chunk {chunk_idx} parse failed ({e}) — using deterministic fallback for this chunk")
+                for s in chunk:
+                    full_plan.append({
+                        "port":    s["port"],
+                        "service": s["service"],
+                        "product": s["product"],
+                        "version": s["version"],
+                        "queries": [f"{s['product']} {s['version']}".strip()]
+                    })
+
+        # ── Safety net: ensure EVERY service has at least one query ──────────
+        planned_ports = {str(p.get("port", "")) for p in full_plan}
+        missing = [s for s in services if str(s["port"]) not in planned_ports]
+        if missing:
+            print(f"  [safety-net] Adding deterministic queries for "
+                  f"{len(missing)} uncovered services: "
+                  f"{[s['port'] for s in missing]}")
+            for s in missing:
+                product = s.get("product") or s.get("service", "unknown")
+                version = s.get("version", "")
+                query   = f"{product} {version}".strip() if version not in ("n/a", "") else product
+                full_plan.append({
+                    "port":    s["port"],
+                    "service": s["service"],
+                    "product": product,
+                    "version": version,
+                    "queries": [query]
+                })
+
+        total_queries = sum(len(p.get("queries", [])) for p in full_plan)
+        print(f"  [plan] {len(full_plan)} services planned, {total_queries} total queries")
+        return full_plan
 
     # ── Phase 2: Python executes queries ─────────────────────────────────────
 
@@ -149,14 +219,21 @@ class VAAgent:
         Index results in ChromaDB with metadata {port, service}.
         Returns populated VectorStoreManager.
         """
+        import shutil
         from src.utils.multi_source_api import MultiSourceCVEDownloader
         from src.utils.vectore_store import VectorStoreManager
 
-        downloader  = MultiSourceCVEDownloader(
+        # Clear stale DB from previous runs — prevents context contamination
+        db_path = "vector_db"
+        if os.path.exists(db_path):
+            shutil.rmtree(db_path)
+            print("  [db] Cleared stale vector_db/")
+
+        downloader   = MultiSourceCVEDownloader(
             nvd_api_key=os.getenv("NVD_API_KEY")
         )
-        vsm         = VectorStoreManager()
-        cve_sources = {}   # {cve_id: {cvss, source, description}}
+        vsm          = VectorStoreManager(db_path=db_path)
+        cve_sources  = {}
         seen_queries = set()
 
         print("\n[Phase 2] Executing NVD queries and indexing results...")
@@ -173,35 +250,39 @@ class VAAgent:
                 seen_queries.add(query_clean)
 
                 print(f"  > [{port}] query: {query_clean}")
-                results = downloader.fetch_by_keyword(
+                # fetch_structured returns full CVEEntry objects (CVSS, has_exploit,
+                # actively_exploited, sources) instead of plain backward-compat strings
+                entries = downloader.fetch_structured(
                     query_clean, results_per_page=10
                 )
-                if not results:
+                if not entries:
                     print(f"    → 0 CVEs")
                     continue
 
                 texts, metas = [], []
-                for item in results:
-                    if isinstance(item, str):
-                        import re as _re
-                        cid = _re.search(r'CVE-[\d-]+', item)
-                        cid = cid.group(0) if cid else "UNKNOWN"
-                        rag_text = item
-                        cvss     = "N/A"
-                    else:
-                        cid      = item.id
-                        cvss     = str(item.cvss_score) if item.cvss_score else "N/A"
-                        rag_text = (item.to_rag_text()
-                                    if hasattr(item, "to_rag_text") else str(item))
+                for item in entries:
+                    cid      = item.id
+                    cvss     = str(item.cvss_score) if item.cvss_score not in (None, "N/A", "") else "N/A"
+                    rag_text = item.to_rag_text()
 
-                    cve_sources[cid] = {
-                        "cvss":        cvss,
-                        "source":      "nvd",
-                        "port":        port,
-                        "service":     service,
-                        "description": rag_text[:300],
-                        "url":         f"https://nvd.nist.gov/vuln/detail/{cid}"
-                    }
+                    # Merge into cve_sources — preserve best CVSS, OR-merge flags
+                    existing = cve_sources.get(cid)
+                    if existing:
+                        existing["has_exploit"]        = existing["has_exploit"] or item.has_exploit
+                        existing["actively_exploited"] = existing["actively_exploited"] or item.actively_exploited
+                        if item.source not in existing["sources"]:
+                            existing["sources"].append(item.source)
+                    else:
+                        cve_sources[cid] = {
+                            "cvss":               cvss,
+                            "sources":            [item.source],
+                            "port":               port,
+                            "service":            service,
+                            "description":        item.description[:300],
+                            "url":                f"https://nvd.nist.gov/vuln/detail/{cid}",
+                            "has_exploit":        item.has_exploit,
+                            "actively_exploited": item.actively_exploited,
+                        }
                     texts.append(rag_text)
                     metas.append({"port": port, "service": service, "cve_id": cid})
 
@@ -268,17 +349,67 @@ class VAAgent:
             if self.verbose:
                 print(f"    [llm] {response[:200]}...")
 
-            # Parse JSON
-            analysis = {}
-            try:
-                m = re.search(r'\{[\s\S]+\}', response)
-                if m:
-                    analysis = json.loads(m.group(0))
-            except Exception:
-                pass
+            # Parse JSON — 3-strategy cascade for llama's inconsistent output
+            def _parse_llm_json(resp):
+                start = resp.find('{')
+                if start == -1: return {}
+                chunk = resp[start:]
+                # S1: raw_decode — handles preamble + braces inside strings
+                try:
+                    raw, _ = json.JSONDecoder().raw_decode(chunk)
+                    return {k.lower(): v for k, v in raw.items()}
+                except Exception: pass
+                # S2: escape raw newlines inside quoted strings, retry
+                fixed = re.sub(r'"(?:[^"\\]|\\.)*"',
+                               lambda m: m.group(0).replace('\n', '\\n'),
+                               chunk, flags=re.DOTALL)
+                try:
+                    raw, _ = json.JSONDecoder().raw_decode(fixed)
+                    return {k.lower(): v for k, v in raw.items()}
+                except Exception: pass
+                # S3: regex — CVEs only from cves_cited section to avoid duplicates
+                sm = re.search(r'"[Ss]everity"\s*:\s*"(\w+)"', resp)
+                cve_end = resp.find('"analysis"') if '"analysis"' in resp else len(resp)
+                cm = list(dict.fromkeys(re.findall(r'CVE-\d{4}-\d+', resp[:cve_end])))
+                if sm:
+                    print(f"    [!] Fallback extracted: severity={sm.group(1)}")
+                    return {"severity": sm.group(1), "cves_cited": cm,
+                            "analysis": "", "remediation": ""}
+                return {}
+            analysis = _parse_llm_json(response)
+            if not analysis:
+                print(f"    [!] All parse strategies failed")
 
             sev   = analysis.get("severity", "Informational")
+
+            # Deterministic override: bindshell / root shell is always Critical
+            backdoor_keywords = ("bindshell", "root shell", "backdoor", "metasploitable")
+            if any(kw in (product + " " + service).lower() for kw in backdoor_keywords):
+                if sev != "Critical":
+                    print(f"    [override] {sev} → Critical (bindshell/root shell detected)")
+                    sev = "Critical"
             cves  = analysis.get("cves_cited", [])
+
+            # Anti-hallucination: accept CVE only if it was retrieved from NVD
+            # (either in cve_sources dict OR visible in the retrieved context text)
+            # Additionally reject CVEs with impossible years (future or pre-1999)
+            import datetime
+            current_year = datetime.datetime.now().year
+            def _valid_cve_year(cve_id: str) -> bool:
+                m = re.match(r'CVE-(\d{4})-', cve_id)
+                if not m:
+                    return False
+                year = int(m.group(1))
+                return 1999 <= year <= current_year
+
+            verified_cves = [c for c in cves
+                             if (c in cve_sources or c in cve_context)
+                             and _valid_cve_year(c)]
+            hallucinated  = [c for c in cves
+                             if c not in verified_cves]
+            if hallucinated:
+                print(f"    [!] Removed hallucinated CVEs: {hallucinated}")
+            cves = verified_cves
 
             # Build CVSS from cve_sources
             best_cvss = "N/A"
@@ -292,25 +423,41 @@ class VAAgent:
                 except Exception:
                     pass
 
-            # Build CVE references with NVD URLs
+            # Build CVE references enriched with all metadata from cve_sources
             cve_refs = []
+            has_exploit        = False
+            actively_exploited = False
             for cid in cves:
-                url = cve_sources.get(cid, {}).get(
-                    "url", f"https://nvd.nist.gov/vuln/detail/{cid}"
-                )
-                cve_refs.append({"id": cid, "url": url})
+                src = cve_sources.get(cid, {})
+                cve_refs.append({
+                    "id":                cid,
+                    "url":               src.get("url", f"https://nvd.nist.gov/vuln/detail/{cid}"),
+                    "cvss":              src.get("cvss", "N/A"),
+                    "sources":           src.get("sources", []),
+                    "has_exploit":       src.get("has_exploit", False),
+                    "actively_exploited": src.get("actively_exploited", False),
+                })
+                has_exploit        = has_exploit or src.get("has_exploit", False)
+                actively_exploited = actively_exploited or src.get("actively_exploited", False)
+
+            # Log important flags
+            if has_exploit:
+                print(f"    [exploit] public exploit available for this service")
+            if actively_exploited:
+                print(f"    [KEV] 🚨 CISA KEV — actively exploited in the wild!")
 
             finding = {
-                "port":        port,
-                "service":     f"{product} {version}".strip(),
-                "target":      svc.get("target", ""),
-                "severity":    sev,
-                "cvss":        best_cvss,
-                "cves":        ", ".join(cves) if cves else "None",
-                "cve_refs":    cve_refs,
-                "analysis":    analysis.get("analysis", ""),
-                "remediation": analysis.get("remediation", ""),
-                "has_exploit": False,
+                "port":               port,
+                "service":            f"{product} {version}".strip(),
+                "target":             svc.get("target", ""),
+                "severity":           sev,
+                "cvss":               best_cvss,
+                "cves":               ", ".join(cves) if cves else "None",
+                "cve_refs":           cve_refs,
+                "analysis":           analysis.get("analysis", ""),
+                "remediation":        analysis.get("remediation", ""),
+                "has_exploit":        has_exploit,
+                "actively_exploited": actively_exploited,
             }
 
             findings.append(finding)
