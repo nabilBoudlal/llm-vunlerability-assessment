@@ -8,7 +8,7 @@ from src.modules.reporter import RiskReporter
 
 load_dotenv()
 
-INPUT_FILE = "data/network_scan.xml"
+INPUT_FILE = "data\\t1.xml"
 MODEL      = os.getenv("VA_MODEL", "llama3:8b")
 
 def main():
