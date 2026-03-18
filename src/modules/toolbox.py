@@ -18,6 +18,38 @@ import os
 import time
 
 
+# ── Product disambiguation filter ───────────────────────────────────────────
+# Maps query keywords to strings that, if found in a CVE description, indicate
+# the CVE belongs to a different product.  Applied after every NVD retrieval.
+_NOISE_MARKERS: dict[str, list[str]] = {
+    "samba":   ["sambar server", "sambar web", "securecrt"],
+    "smbd":    ["sambar server", "sambar web", "securecrt"],
+    "telnetd": ["interaccess telnetd", "interaccess telnet server"],
+    "telnet":  ["interaccess telnetd", "interaccess telnet server"],
+    "proftpd": ["wuarchive ftpd", "wu-ftpd"],
+    "mysql":   ["microsoft sql", "mssql"],
+    "redis":   ["aws elasticache"],
+}
+
+def _disambiguate(query: str, results: list) -> tuple[list, int]:
+    """Strip CVEs that provably belong to a different product."""
+    q = query.lower()
+    markers: list[str] = []
+    for key, noise in _NOISE_MARKERS.items():
+        if key in q:
+            markers.extend(noise)
+    if not markers:
+        return results, 0
+    kept, removed = [], 0
+    for r in results:
+        desc = (r.get("description") or "").lower()
+        if any(m in desc for m in markers):
+            removed += 1
+        else:
+            kept.append(r)
+    return kept, removed
+
+
 class ToolBox:
     """
     Tool implementations backed by HybridCVEDownloader (hybrid_nvd_api.py).
@@ -86,6 +118,11 @@ class ToolBox:
         results = self.dl.fetch_structured(query, results_per_page=10)
         if not results:
             return f"search_nvd({query!r}): No CVEs found."
+        results, removed = _disambiguate(query, results)
+        if removed:
+            print(f"    [disambig] Removed {removed} off-product CVE(s) for {query!r}")
+        if not results:
+            return f"search_nvd({query!r}): No relevant CVEs found (off-product results filtered)."
         for r in results:
             self._store(r, "nvd_keyword")
         lines = [self._fmt(r) for r in results]
@@ -104,6 +141,11 @@ class ToolBox:
         results = self.dl.fetch_by_cpe(cpe_obj, max_results=15)
         if not results:
             return f"lookup_cpe({product!r}, {version!r}): No CVEs found."
+        results, removed = _disambiguate(product, results)
+        if removed:
+            print(f"    [disambig] Removed {removed} off-product CVE(s) for {product!r}")
+        if not results:
+            return f"lookup_cpe({product!r}, {version!r}): No relevant CVEs found (off-product results filtered)."
         for r in results:
             self._store(r, "nvd_cpe")
         lines = [self._fmt(r) for r in results]
@@ -225,55 +267,104 @@ class ToolBox:
         except Exception as ex:
             return f"search_exploitdb({query!r}): Error — {ex}"
 
+    # OSV ecosystem mapping: product name prefix → ecosystems to try in order.
+    # OSV requires a valid ecosystem — without it the API returns HTTP 400.
+    # We try Ubuntu first (matching the test VM), then Debian, then Linux kernel.
+    _OSV_ECOSYSTEMS: dict[str, list[str]] = {
+        "openssh":    ["Ubuntu:20.04", "Debian:11", "Ubuntu:22.04"],
+        "samba":      ["Ubuntu:20.04", "Debian:11", "Ubuntu:22.04"],
+        "apache":     ["Ubuntu:20.04", "Debian:11", "Ubuntu:22.04"],
+        "httpd":      ["Ubuntu:20.04", "Debian:11"],
+        "postgresql": ["Ubuntu:20.04", "Debian:11"],
+        "postgres":   ["Ubuntu:20.04", "Debian:11"],
+        "mysql":      ["Ubuntu:20.04", "Debian:11"],
+        "proftpd":    ["Ubuntu:20.04", "Debian:11"],
+        "redis":      ["Ubuntu:20.04", "Debian:11"],
+        "dovecot":    ["Ubuntu:20.04", "Debian:11"],
+        "postfix":    ["Ubuntu:20.04", "Debian:11"],
+        "nfs":        ["Ubuntu:20.04", "Debian:11", "Linux"],
+        "linux":      ["Linux", "Ubuntu:20.04"],
+        "openssl":    ["Ubuntu:20.04", "Debian:11"],
+    }
+    # OSV canonical package names (may differ from Nmap service banners)
+    _OSV_PKG_NAME: dict[str, str] = {
+        "apache":     "apache2",
+        "httpd":      "apache2",
+        "openssh":    "openssh",
+        "postgresql": "postgresql",
+        "postgres":   "postgresql",
+        "proftpd":    "proftpd",
+    }
+
     def search_osv(self, query: str) -> str:
         """
-        Real OSV (Google Open Source Vulnerability) database query.
-        Excellent for open-source software: Apache, Samba, OpenSSH, MySQL, etc.
+        OSV (Google Open Source Vulnerability) database query.
+        Tries multiple Ubuntu/Debian ecosystems — the API requires an ecosystem
+        field; bare package name queries return HTTP 400.
+        Best source for: OpenSSH, PostgreSQL, Samba, Apache, Redis, MySQL.
+        Example: search_osv("openssh")
         """
         import requests
         print(f"  [tool] search_osv({query!r})")
+
+        # Extract base product name and optional version from query
+        parts   = query.strip().lower().split()
+        base    = parts[0] if parts else query.lower()
+        version = parts[1] if len(parts) > 1 else None
+
+        # Resolve canonical OSV package name
+        pkg_name   = self._OSV_PKG_NAME.get(base, base)
+        ecosystems = self._OSV_ECOSYSTEMS.get(base, ["Ubuntu:20.04", "Debian:11"])
+
         try:
-            package_name = query.strip().split()[0] if query.strip() else query
-            payload = {"package": {"name": package_name}}
-            r = requests.post("https://api.osv.dev/v1/query", json=payload, timeout=15)
-            if r.status_code != 200:
-                return (f"search_osv({query!r}): HTTP {r.status_code}. "
-                        f"OSV may be temporarily unavailable.")
-            vulns = r.json().get("vulns", [])
-            if not vulns:
-                r2 = requests.post(
+            all_vulns: list = []
+            tried: list[str] = []
+
+            for eco in ecosystems:
+                payload: dict = {"package": {"name": pkg_name, "ecosystem": eco}}
+                if version:
+                    payload["version"] = version
+                r = requests.post(
                     "https://api.osv.dev/v1/query",
-                    json={"package": {"name": query}},
-                    timeout=15,
+                    json=payload, timeout=15,
                 )
-                vulns = r2.json().get("vulns", []) if r2.status_code == 200 else []
-            if not vulns:
-                return f"search_osv({query!r}): No vulnerabilities found in OSV database."
+                tried.append(f"{eco}→{r.status_code}")
+                if r.status_code == 200:
+                    vulns = r.json().get("vulns", [])
+                    if vulns:
+                        all_vulns = vulns
+                        print(f"    [osv] Found {len(vulns)} results in {eco}")
+                        break  # stop at first ecosystem that returns results
+
+            if not all_vulns:
+                return (f"search_osv({query!r}): No vulnerabilities found "
+                        f"(tried: {', '.join(tried)}).")
 
             lines = []
-            for v in vulns[:15]:
+            for v in all_vulns[:15]:
                 osv_id      = v.get("id", "?")
                 summary     = v.get("summary", v.get("details", ""))[:100]
                 cve_aliases = [a for a in v.get("aliases", []) if a.startswith("CVE-")]
                 cve_str     = ", ".join(cve_aliases) if cve_aliases else osv_id
-                severity    = ""
+                cvss_str    = ""
                 for sev in v.get("severity", []):
-                    if sev.get("type") in ("CVSS_V3", "CVSS_V31"):
-                        severity = f" | CVSS: {sev.get('score','?')}"
+                    if sev.get("type") in ("CVSS_V3", "CVSS_V31", "CVSS_V2"):
+                        cvss_str = f" | CVSS: {sev.get('score','?')}"
                         break
                 for cve in cve_aliases:
                     if cve not in self._cve_cache:
                         self._cve_cache[cve] = {
-                            "cvss": "N/A", "description": summary,
-                            "url": f"https://osv.dev/vulnerability/{osv_id}",
-                            "has_exploit": False,
+                            "cvss":               "N/A",
+                            "description":        summary,
+                            "url":                f"https://osv.dev/vulnerability/{osv_id}",
+                            "has_exploit":        False,
                             "actively_exploited": cve in self._kev_ids,
-                            "source": "osv",
+                            "source":             "osv",
                         }
-                lines.append(f"  {cve_str} [{osv_id}]{severity}: {summary}")
+                lines.append(f"  {cve_str} [{osv_id}]{cvss_str}: {summary}")
 
-            return (f"search_osv({query!r}) → {len(vulns)} OSV entries "
-                    f"(showing top {min(len(vulns),15)}):\n" + "\n".join(lines))
+            return (f"search_osv({query!r}) → {len(all_vulns)} OSV entries "
+                    f"(showing top {min(len(all_vulns),15)}):\n" + "\n".join(lines))
         except Exception as ex:
             return f"search_osv({query!r}): Error — {ex}"
 
@@ -340,6 +431,42 @@ class ToolBox:
         except Exception as ex:
             return f"search_circl({cve_id}): Error — {ex}"
 
+    def search_epss(self, cve_id: str) -> str:
+        """
+        Query the FIRST.org EPSS API for exploitation probability.
+        EPSS (Exploit Prediction Scoring System) gives the probability that
+        a CVE will be exploited in the next 30 days, complementing CVSS severity.
+        A low-CVSS CVE with high EPSS is more urgent than a high-CVSS CVE with
+        low EPSS.
+        Example: search_epss("CVE-2021-44228")
+        """
+        import requests
+        print(f"  [tool] search_epss({cve_id!r})")
+        try:
+            r = requests.get(
+                "https://api.first.org/data/v1/epss",
+                params={"cve": cve_id},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                data = r.json().get("data", [])
+                if data:
+                    entry  = data[0]
+                    epss   = float(entry.get("epss", 0)) * 100
+                    pct    = float(entry.get("percentile", 0)) * 100
+                    date   = entry.get("date", "unknown")
+                    urgency = "HIGH" if epss >= 10 else ("MEDIUM" if epss >= 1 else "LOW")
+                    return (
+                        f"search_epss({cve_id}): "
+                        f"EPSS={epss:.2f}% exploitation probability in next 30 days "
+                        f"[{urgency} urgency, higher than {pct:.0f}% of all CVEs] "
+                        f"— data as of {date}"
+                    )
+                return f"search_epss({cve_id}): No EPSS data found for this CVE."
+            return f"search_epss({cve_id}): API error {r.status_code}."
+        except Exception as e:
+            return f"search_epss({cve_id}): Request failed ({e})."
+
     # ── Dispatcher ─────────────────────────────────────────────────────────────
 
     def execute(self, tool_name: str, tool_input: dict) -> str:
@@ -355,13 +482,15 @@ class ToolBox:
             elif tool_name == "get_cve":
                 return self.get_cve(tool_input.get("cve_id", ""))
             elif tool_name == "check_kev":
-                return self.check_kev(tool_input.get("keyword", ""))
+                return self.check_kev(tool_input.get("keyword") or tool_input.get("query", ""))
             elif tool_name == "search_exploitdb":
                 return self.search_exploitdb(tool_input.get("query", ""))
             elif tool_name == "search_osv":
                 return self.search_osv(tool_input.get("query", ""))
             elif tool_name == "search_circl":
                 return self.search_circl(tool_input.get("cve_id", ""))
+            elif tool_name == "search_epss":
+                return self.search_epss(tool_input.get("cve_id", ""))
             else:
                 return f"Unknown tool: {tool_name}"
         except Exception as e:

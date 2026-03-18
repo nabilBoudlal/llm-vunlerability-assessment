@@ -17,7 +17,7 @@ load_dotenv()
 
 def main():
     # ── Collect scan files from CLI args ─────────────────────────────────────
-    scan_files = sys.argv[1:] if len(sys.argv) > 1 else ["data/test2.xml"]
+    scan_files = sys.argv[1:] if len(sys.argv) > 1 else ["data/test4.xml"]
 
     # Validate all files exist before starting
     missing = [f for f in scan_files if not os.path.exists(f)]

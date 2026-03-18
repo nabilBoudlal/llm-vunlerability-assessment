@@ -163,12 +163,23 @@ def _parse_all_actions(text: str) -> list[tuple[str, dict | None]]:
         results.append((action, input_dict))
 
     # ── 2. Bare FINAL_ANSWER blocks (no "Action:" prefix) ────────────────────
+    # Handles all variants the 8B model produces:
+    #   **FINAL_ANSWER:**\n{...}
+    #   **FINAL_ANSWER:**\n\n```\n{...}\n```   ← most common 8B pattern
+    #   **FINAL_ANSWER:**\n```json\n{...}\n```
+    #   FINAL_ANSWER:\n{...}
     if not any(a == "FINAL_ANSWER" for a, _ in results):
+        # Pattern 1: **FINAL_ANSWER:** (colon inside asterisks) + optional fence
         bare = re.search(
-            r'(?:\*{0,2}FINAL_ANSWER\*{0,2}|#{1,3}\s*FINAL_ANSWER)'
-            r'\s*\n\s*(\{[\s\S]+)',
+            r'\*\*FINAL_ANSWER:\*\*\s*\n\s*(?:```[a-z]*\s*\n)?\s*(\{[\s\S]+)',
             text, re.IGNORECASE
         )
+        # Pattern 2: **FINAL_ANSWER** : (colon outside) or plain FINAL_ANSWER:
+        if not bare:
+            bare = re.search(
+                r'(?:\*{0,2}FINAL_ANSWER\*{0,2})\s*:\s*\n\s*(?:```[a-z]*\s*\n)?\s*(\{[\s\S]+)',
+                text, re.IGNORECASE
+            )
         if bare:
             input_dict = _try_parse_json(bare.group(1))
             if input_dict:

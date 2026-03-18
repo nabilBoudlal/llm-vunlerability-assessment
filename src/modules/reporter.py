@@ -223,7 +223,7 @@ def _dashboard(wb, data, generated):
 
     ws.merge_cells("A2:H2")
     c = ws["A2"]
-    c.value = f"Generated: {generated}   |   Framework: LLM-VA ReAct (Hybrid RAG)"
+    c.value = f"Generated: {generated}   |   Framework: LLM-VA ReAct Agent"
     c.font = Font(name="Arial", size=9, color="6B7280")
     c.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[2].height = 18
